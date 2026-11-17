@@ -227,7 +227,10 @@ def submit(batch: CreateBatch, actor='web'):
         try:
             aws.get_instance(instanceName=name)
         except ClientError as e:
-            if e.response.get('Error', {}).get('Code') not in ('ServiceException', 'NotFoundException') or e.response.get('ResponseMetadata', {}).get('HTTPStatusCode') not in (404, None):
+            code = e.response.get('Error', {}).get('Code')
+            http = e.response.get('ResponseMetadata', {}).get('HTTPStatusCode')
+            not_found = code == 'NotFoundException' or (code == 'ServiceException' and http in (404, None))
+            if not not_found:
                 raise HTTPException(502, 'Unable to verify whether an instance already exists')
         else:
             raise HTTPException(409, f'Instance already exists: {name}')

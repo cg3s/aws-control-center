@@ -58,6 +58,23 @@ def test_http_preview_then_confirm_and_worker(env):
     assert q.detail(result['id'])['status'] == 'completed'
 
 
+@pytest.mark.parametrize(('code', 'status', 'expected'), [
+    ('NotFoundException', 400, 200),
+    ('ServiceException', 404, 200),
+    ('ServiceException', 400, 502),
+])
+def test_create_preflight_handles_lightsail_not_found_errors(env, code, status, expected):
+    _, q, aws, c, headers = env
+    aws.get_instance.side_effect = ClientError(
+        {'Error': {'Code': code}, 'ResponseMetadata': {'HTTPStatusCode': status}},
+        'GetInstance')
+    response = c.post('/api/tasks/lightsail/create',
+        json=payload(dry_run=False, confirm='CREATE'), headers=headers)
+    assert response.status_code == expected, response.text
+    if expected == 200:
+        assert q.list_tasks()['items'][0]['status'] == 'queued'
+
+
 def test_encrypted_bootstrap_reaches_aws_and_detail_is_redacted(env):
     app, q, aws, c, headers = env
     public = Ed25519PrivateKey.generate().public_key().public_bytes(

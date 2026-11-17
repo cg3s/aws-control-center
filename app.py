@@ -44,6 +44,8 @@ app = FastAPI(title='AWS Control Center v9.1', docs_url=None, redoc_url=None)
 async def safe_validation_error(request: Request, exc: RequestValidationError):
     if request.url.path == '/api/key-accounts':
         return JSONResponse(status_code=422, content={'detail': 'Invalid AWS credential form fields'})
+    if request.url.path == '/api/tasks/lightsail/create':
+        return JSONResponse(status_code=422, content={'detail': 'Invalid create form fields; check names, sizes and launch configuration'})
     return JSONResponse(status_code=422, content={'detail': exc.errors()})
 
 
@@ -625,24 +627,33 @@ def batch_action(data: BatchAction, request: Request):
 
 
 @app.get('/api/traffic', dependencies=[Depends(auth)])
-def traffic(profile: str, region: str, instance: str, days: int = 7):
+def traffic(profile: str, region: str, instance: str, days: int = 7, service: str = 'lightsail'):
     check_region(region)
     if not 1 <= days <= 30 or not 1 <= len(instance) <= 200:
         raise HTTPException(400, 'Invalid traffic parameters')
+    if service not in ('lightsail', 'ec2'):
+        raise HTTPException(400, 'Invalid traffic service')
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
     try:
-        api = client(profile, 'lightsail', region)
+        api = client(profile, 'lightsail' if service == 'lightsail' else 'cloudwatch', region)
         out = {}
         # Lightsail CloudWatch metrics NetworkIn/NetworkOut return bytes per period.
         for metric in ('NetworkIn', 'NetworkOut'):
-            data = api.get_instance_metric_data(instanceName=instance, metricName=metric,
-                 period=3600, startTime=start, endTime=end, unit='Bytes', statistics=['Sum'])
-            points = data.get('metricData', [])
+            if service == 'lightsail':
+                data = api.get_instance_metric_data(instanceName=instance, metricName=metric,
+                     period=3600, startTime=start, endTime=end, unit='Bytes', statistics=['Sum'])
+                points = data.get('metricData', [])
+            else:
+                data = api.get_metric_statistics(Namespace='AWS/EC2', MetricName=metric,
+                    Dimensions=[{'Name': 'InstanceId', 'Value': instance}], Period=3600,
+                    StartTime=start, EndTime=end, Unit='Bytes', Statistics=['Sum'])
+                points = [{'timestamp': p['Timestamp'], 'sum': p.get('Sum', 0)} for p in data.get('Datapoints', [])]
+            points = sorted(points, key=lambda p: p['timestamp'])
             out[metric] = {'bytes': round(sum(float(p.get('sum', 0) or 0) for p in points)),
                            'points': [{'time': p['timestamp'].astimezone(timezone.utc).isoformat(),
                                       'bytes': float(p.get('sum', 0) or 0)} for p in points]}
-        return {'instance': instance, 'region': region, 'profile': profile, 'days': days,
+        return {'instance': instance, 'region': region, 'profile': profile, 'days': days, 'service': service,
                 'start': start.isoformat(), 'end': end.isoformat(), 'metrics': out,
                 'note': 'CloudWatch sample sums only. Not Lightsail monthly billable transfer or remaining quota.'}
     except (ClientError, BotoCoreError) as e:

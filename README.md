@@ -1,5 +1,7 @@
 **V9.1 更新：** Web 添加多个 AWS Access Key 并激活，无需强制 `.aws`。详见 [V9_1_ACCESS_KEYS.md](V9_1_ACCESS_KEYS.md)。
 
+实例流量、中文区域、创建确认与 Linux 启动脚本 / SSH Key / root 配置更新及 aaPanel 升级步骤见 [UI_UPDATE.md](UI_UPDATE.md)。
+
 > **V7.0:** See [V7_UPGRADE.md](V7_UPGRADE.md) for AWS regional catalog, read-only task verification and new CLI commands.
 
 > **V6.0 upgrade:** See [V6_UPGRADE.md](V6_UPGRADE.md) for the persistent Lightsail create queue, Web UI, CLI, Docker and systemd instructions.

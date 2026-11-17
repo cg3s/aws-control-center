@@ -4,8 +4,10 @@ Creation calls are intentionally NOT automatically retried: an AWS timeout may m
 that AWS created a resource despite the client receiving an exception.
 """
 import json
+import base64
 import os
 import re
+import shlex
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -15,8 +17,10 @@ from uuid import uuid4
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
+from passlib.hash import sha512_crypt
+from cryptography.exceptions import UnsupportedAlgorithm
 
-from app import audit, check_region, client, db, valid_profile
+from app import audit, check_region, client, db, valid_profile, vault
 
 MAX_BATCH = 10
 MAX_PENDING = 100
@@ -32,6 +36,58 @@ class CreateBatch(BaseModel):
     availability_zone: str = Field(default='', max_length=100)
     dry_run: bool = True
     confirm: str = ''
+    user_data: str = Field(default='', max_length=40000)
+    key_pair_name: str = Field(default='', max_length=255)
+    ssh_public_key: str = Field(default='', max_length=12000)
+    root_password: str = Field(default='', max_length=256, repr=False)
+    enable_root_ssh: bool = False
+
+
+def launch_script(batch: CreateBatch):
+    """Generate Linux cloud-init user data without embedding a plaintext password."""
+    if batch.root_password and (len(batch.root_password) < 16 or any(c in batch.root_password for c in '\r\n\x00')):
+        raise HTTPException(400, 'Root password must be at least 16 characters without newlines or NUL')
+    keys = [line.strip() for line in batch.ssh_public_key.splitlines() if line.strip()]
+    from cryptography.hazmat.primitives.serialization import load_ssh_public_key
+    for key in keys:
+        try:
+            load_ssh_public_key(key.encode())
+        except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
+            raise HTTPException(400, 'Invalid OpenSSH public key; paste a public key, not a private key') from exc
+    if batch.enable_root_ssh and not (keys or batch.root_password):
+        raise HTTPException(400, 'Root SSH requires a root public key or root password')
+    if keys and not batch.enable_root_ssh:
+        raise HTTPException(400, 'Enable root SSH to install root public keys, or use a Lightsail key pair for the default user')
+    config = {'users': ['default'], 'runcmd': []}
+    if batch.root_password or keys or batch.enable_root_ssh:
+        root = {'name': 'root'}
+        if keys:
+            root['ssh_authorized_keys'] = keys
+        if batch.root_password:
+            root.update(hashed_passwd=sha512_crypt.using(rounds=100000).hash(batch.root_password), lock_passwd=False)
+        config['users'].append(root)
+    if batch.enable_root_ssh:
+        config['disable_root'] = False
+        if batch.root_password:
+            config['ssh_pwauth'] = True
+        # Put global options before Include/Match: OpenSSH uses the first value.
+        options = 'PermitRootLogin yes\nPubkeyAuthentication yes\n'
+        if batch.root_password:
+            options += 'PasswordAuthentication yes\n'
+        command = "set -eu\ncp -p /etc/ssh/sshd_config /etc/ssh/sshd_config.awscc-backup\n"
+        command += "{ printf %s " + shlex.quote(options) + "; cat /etc/ssh/sshd_config.awscc-backup; } > /etc/ssh/sshd_config\n"
+        command += 'if ! /usr/sbin/sshd -t; then cp -p /etc/ssh/sshd_config.awscc-backup /etc/ssh/sshd_config; exit 1; fi\n'
+        command += '(systemctl reload ssh || systemctl reload sshd)\n'
+        config['runcmd'].append(['sh', '-c', command])
+    if batch.user_data:
+        script = base64.b64encode(batch.user_data.replace('\r\n', '\n').encode()).decode()
+        config['runcmd'].append(['bash', '-c', f'printf %s {shlex.quote(script)} | base64 -d > /var/lib/cloud/awscc-launch.sh && chmod 700 /var/lib/cloud/awscc-launch.sh && bash /var/lib/cloud/awscc-launch.sh'])
+    if not config['runcmd'] and len(config['users']) == 1:
+        return ''
+    result = '#cloud-config\n' + json.dumps(config)
+    if len(result.encode()) > 65536:
+        raise HTTPException(400, 'Combined launch configuration exceeds 64 KiB')
+    return result
 
 
 def now():
@@ -60,22 +116,24 @@ def initialize():
         c.execute('CREATE INDEX IF NOT EXISTS task_item_status ON task_items(task_id,status)')
 
 
+def catalog_pages(method, key, **kwargs):
+    values, token = [], None
+    for _ in range(20):
+        response = method(**kwargs, **({'pageToken': token} if token else {}))
+        values.extend(response.get(key, []))
+        token = response.get('nextPageToken')
+        if not token:
+            return values
+    raise HTTPException(502, 'Catalog exceeds pagination safety limit')
+
+
 def catalog(profile: str, region: str):
     """Read-only regional Lightsail catalog. Never assume IDs are globally valid."""
     check_region(region)
     valid_profile(profile)
     aws = client(profile, 'lightsail', region)
-    def paged(method, key):
-        values, token = [], None
-        for _ in range(20):
-            response = method(**({'pageToken': token} if token else {}))
-            values.extend(response.get(key, []))
-            token = response.get('nextPageToken')
-            if not token: break
-        if token: raise HTTPException(502, 'Catalog exceeds pagination safety limit')
-        return values
-    bundles = paged(lambda **kw: aws.get_bundles(includeInactive=False, **kw), 'bundles')
-    blueprints = paged(lambda **kw: aws.get_blueprints(includeInactive=False, **kw), 'blueprints')
+    bundles = catalog_pages(aws.get_bundles, 'bundles', includeInactive=False)
+    blueprints = catalog_pages(aws.get_blueprints, 'blueprints', includeInactive=False)
     regions = aws.get_regions(includeAvailabilityZones=True).get('regions', [])
     selected = next((x for x in regions if x.get('name') == region), {})
     return {'profile':profile, 'region':region,
@@ -136,20 +194,26 @@ def validate(batch: CreateBatch):
         raise HTTPException(400, 'Confirmation must be CREATE')
     aws = client(batch.profile, 'lightsail', batch.region)
     # AWS supplies region-specific bundle and blueprint catalogs.
-    bundles = aws.get_bundles(includeInactive=False).get('bundles', [])
+    bundles = catalog_pages(aws.get_bundles, 'bundles', includeInactive=False)
     bundle = next((b for b in bundles if b.get('bundleId') == batch.bundle_id and b.get('isActive', True)), None)
     if bundle is None:
         raise HTTPException(400, 'Bundle ID is not available in this region')
-    blueprints = aws.get_blueprints(includeInactive=False).get('blueprints', [])
+    blueprints = catalog_pages(aws.get_blueprints, 'blueprints', includeInactive=False)
     blueprint = next((b for b in blueprints if b.get('blueprintId') == batch.blueprint_id and b.get('isActive', True)), None)
     if blueprint is None:
         raise HTTPException(400, 'Blueprint ID is not available in this region')
+    if (batch.user_data or batch.ssh_public_key or batch.root_password or batch.enable_root_ssh) and (
+            blueprint.get('platform') == 'WINDOWS' or 'windows' in batch.blueprint_id.lower()):
+        raise HTTPException(400, 'Launch scripts and root configuration require a Linux/Unix blueprint')
     estimated = round(float(bundle.get('price') or 0) * len(batch.names), 2)
     return aws, estimated
 
 
 def submit(batch: CreateBatch, actor='web'):
+    if batch.dry_run and batch.confirm:
+        raise HTTPException(400, 'Confirmation requires dry_run=false; request was not submitted')
     aws, estimate = validate(batch)
+    bootstrap = launch_script(batch)
     if batch.dry_run:
         # This is a metadata/validation preview, NOT an AWS transactional dry-run.
         return {'dry_run': True, 'names': batch.names, 'count': len(batch.names),
@@ -171,6 +235,11 @@ def submit(batch: CreateBatch, actor='web'):
     timestamp = now()
     payload = batch.model_dump() if hasattr(batch, 'model_dump') else batch.dict()
     payload.pop('confirm', None)
+    # Arbitrary launch scripts can also contain secrets. Never store or return them in clear text.
+    for field in ('root_password', 'user_data', 'ssh_public_key'):
+        payload.pop(field, None)
+    if bootstrap:
+        payload['launch_encrypted'] = vault().encrypt(bootstrap.encode()).decode()
     with db() as conn:
         conn.execute('BEGIN IMMEDIATE')
         pending = conn.execute("SELECT count(*) FROM task_items ti JOIN tasks t ON ti.task_id=t.id WHERE ti.status='queued' AND t.status IN ('queued','running')").fetchone()[0]
@@ -205,6 +274,8 @@ def detail(identifier):
             raise HTTPException(404, 'Task not found')
         task = dict(record)
         task['payload'] = json.loads(task['payload'])
+        if task['payload'].pop('launch_encrypted', None):
+            task['payload']['launch_configured'] = True
         task['items'] = [dict(x) for x in conn.execute('SELECT resource_name,status,attempted_at,finished_at,error,verification,verified_at,verification_detail FROM task_items WHERE task_id=? ORDER BY id', (identifier,))]
     return task
 
@@ -268,6 +339,10 @@ def run_once():
         api = client(item['profile'], 'lightsail', item['region'])
         kwargs = dict(instanceNames=[item['resource_name']], availabilityZone=args.get('availability_zone') or item['region'] + 'a',
                       blueprintId=args['blueprint_id'], bundleId=args['bundle_id'])
+        if args.get('launch_encrypted'):
+            kwargs['userData'] = vault().decrypt(args['launch_encrypted'].encode()).decode()
+        if args.get('key_pair_name'):
+            kwargs['keyPairName'] = args['key_pair_name']
         # Server receives one create call for one name, limiting ambiguous partial responses.
         api.create_instances(**kwargs)
         finish_item(item, True)

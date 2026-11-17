@@ -1,4 +1,5 @@
 import importlib
+import os
 import sys
 from unittest.mock import MagicMock
 
@@ -48,7 +49,9 @@ def test_key_crud_activate_and_no_leak(env, monkeypatch):
     encrypted=(path/'control.db').read_bytes()
     assert data['secret_access_key'].encode() not in encrypted
     assert (path/'credential.key').exists()
-    assert (path/'credential.key').stat().st_mode & 0o777 == 0o600
+    # Windows reports DOS attributes here; POSIX permissions apply on Linux deployment hosts.
+    if os.name == 'posix':
+        assert (path/'credential.key').stat().st_mode & 0o777 == 0o600
     r=client.post('/api/key-accounts/activate',json={'alias':'prod1'},headers=headers)
     assert r.status_code==200
     assert client.get('/api/config').json()['active_profile']=='prod1'

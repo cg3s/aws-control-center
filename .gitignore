@@ -3,3 +3,6 @@ data/
 __pycache__/
 .pytest_cache/
 *.pyc
+.venv/
+frontend/node_modules/
+frontend/*.tsbuildinfo

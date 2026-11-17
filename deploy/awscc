@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if [[ $EUID -ne 0 ]]; then echo 'Run as: sudo awscc <command>' >&2; exit 1; fi
+usage() { echo 'Usage: sudo awscc {status|start|stop|restart|logs|health|backup|upgrade PATH|instances|ip|traffic|cost|accounts|audit|tasks}'; }
+case "${1:-}" in
+  status) systemctl --no-pager status awscc-web.service awscc-worker.service awscc-task-worker.service || true;;
+  start|stop|restart) systemctl "$1" awscc-web.service awscc-worker.service awscc-task-worker.service;;
+  logs) journalctl -u awscc-web.service -u awscc-worker.service -u awscc-task-worker.service -f --no-pager;;
+  web-logs) journalctl -u awscc-web.service -f --no-pager;;
+  worker-logs) journalctl -u awscc-worker.service -u awscc-task-worker.service -f --no-pager;;
+  task-logs) journalctl -u awscc-task-worker.service -f --no-pager;;
+  health) curl --fail --silent --show-error --max-time 10 -o /dev/null -w 'HTTP %{http_code}\n' http://127.0.0.1:8000/;;
+  backup)
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    dest="/var/backups/aws-control-center"; mkdir -p "$dest"; chmod 0700 "$dest"
+    # SQLite backup API preserves consistency even when WAL mode is enabled.
+    /opt/aws-control-center/.venv/bin/python - "$dest/control-$stamp.db" <<'PY'
+import sqlite3,sys
+src=sqlite3.connect('/var/lib/aws-control-center/control.db')
+out=sqlite3.connect(sys.argv[1]); src.backup(out); out.close();src.close()
+PY
+    chmod 0600 "$dest/control-$stamp.db"
+    if [[ -f /var/lib/aws-control-center/credential.key ]]; then
+      install -m 0600 /var/lib/aws-control-center/credential.key "$dest/control-$stamp.key"
+      echo "Encryption key backup: $dest/control-$stamp.key (protect both files)"
+    fi
+    echo "Backup saved: $dest/control-$stamp.db (configuration file excluded)";;
+  upgrade)
+    src="${2:-}"; [[ -n "$src" && -f "$src/app.py" && -f "$src/worker.py" && -f "$src/requirements.txt" && -d "$src/static" ]] || { echo 'Provide extracted source directory' >&2; exit 2; }
+    "$0" backup
+    systemctl stop awscc-worker.service awscc-web.service
+    systemctl stop awscc-task-worker.service 2>/dev/null || true
+    for p in app.py worker.py taskqueue.py cli.py requirements.txt; do install -m 0644 "$src/$p" "/opt/aws-control-center/$p"; done
+    cp -a "$src/static/." /opt/aws-control-center/static/
+    install -m 0755 "$src/deploy/awscc" /usr/local/bin/awscc
+    install -m 0755 "$src/deploy/awscc-resource-launcher.py" /opt/aws-control-center/resource-launcher.py
+    /opt/aws-control-center/.venv/bin/python -m pip install -r /opt/aws-control-center/requirements.txt
+    if [[ ! -f /etc/systemd/system/awscc-task-worker.service ]]; then
+      echo 'Installing task worker service (V6 migration)'
+      sed 's@ExecStart=.*/worker.py@ExecStart=/opt/aws-control-center/.venv/bin/python taskqueue.py@;s@Description=AWS Control Center Monitor Worker@Description=AWS Control Center Create Task Worker@' /etc/systemd/system/awscc-worker.service > /etc/systemd/system/awscc-task-worker.service
+      systemctl daemon-reload
+      systemctl enable awscc-task-worker.service
+    fi
+    systemctl start awscc-web.service awscc-worker.service awscc-task-worker.service
+    echo 'Upgrade completed; check: sudo awscc status';;
+  instances|ip|traffic|cost|accounts|audit|tasks) exec /usr/bin/python3 /opt/aws-control-center/resource-launcher.py "$@";;
+  *) usage; exit 2;;
+esac

@@ -1,0 +1,35 @@
+services:
+  aws-control-center:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      AWS_EC2_METADATA_DISABLED: "true"
+    security_opt:
+      - no-new-privileges:true
+  aws-monitor-worker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    command: ["python", "worker.py"]
+    volumes:
+      - ./data:/app/data
+    environment:
+      AWS_EC2_METADATA_DISABLED: "true"
+    security_opt:
+      - no-new-privileges:true
+  aws-task-worker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    command: ["python", "taskqueue.py"]
+    volumes:
+      - ./data:/app/data
+    environment:
+      AWS_EC2_METADATA_DISABLED: "true"
+    security_opt:
+      - no-new-privileges:true

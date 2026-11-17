@@ -149,6 +149,19 @@ sudo grep '^APP_PASSWORD=' /etc/aws-control-center/awscc.env
 
 AWS 凭据默认使用安装指定用户的 `~/.aws/config` 和 `~/.aws/credentials`，与 Docker 挂载的 `~/.aws` 相互独立，确保对应非 root 用户具有读取权限。EC2 Instance Profile 默认禁用，如需实例角色需按实际环境调整（不要无意打开元数据访问）。
 
+### 原生部署启动时报虚拟环境权限错误
+
+如果日志出现 `PermissionError: ... /opt/aws-control-center/.venv/pyvenv.cfg`，旧版安装器首次创建配置后的 `umask 077` 会导致 root 创建的虚拟环境无法被服务用户读取。可以在服务器执行：
+
+```bash
+sudo chmod -R go+rX /opt/aws-control-center/.venv
+sudo awscc restart
+sudo awscc health
+sudo awscc status
+```
+
+这里只补充虚拟环境的读取和目录遍历权限，不增加写权限。新版安装和升级脚本已修复此问题，并会修复已有虚拟环境的权限。
+
 ### 带域名和现有 TLS 证书的 Nginx 部署
 
 ```bash

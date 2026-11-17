@@ -36,8 +36,10 @@ cp -a "$APP_SRC/static/." "$INSTALL_DIR/static/"
 ENV_FILE="$CONFIG_DIR/awscc.env"
 if [[ ! -e "$ENV_FILE" ]]; then
   PASS="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
-  umask 077
-  cat > "$ENV_FILE" <<ENV
+  # Keep the private config umask scoped; the service user must read the venv.
+  (
+    umask 077
+    cat > "$ENV_FILE" <<ENV
 APP_PASSWORD=$PASS
 COOKIE_SECURE=$( [[ -n "$DOMAIN" ]] && echo true || echo false )
 AWS_REGIONS=us-east-1,us-west-2,ap-northeast-1,ap-northeast-2,ap-southeast-1,eu-west-1
@@ -51,6 +53,7 @@ AWS_CONFIG_FILE=$HOME_DIR/.aws/config
 AWS_SHARED_CREDENTIALS_FILE=$HOME_DIR/.aws/credentials
 AWS_EC2_METADATA_DISABLED=true
 ENV
+  )
   echo "Created $ENV_FILE. Retrieve APP_PASSWORD using: sudo grep '^APP_PASSWORD=' $ENV_FILE"
 else
   echo "Preserved existing configuration $ENV_FILE"
@@ -61,8 +64,14 @@ fi
 chown root:"$(id -gn "$DEPLOY_USER")" "$ENV_FILE"
 chmod 0640 "$ENV_FILE"
 # Dedicated environment, upgraded in place; no system Python mutations.
-python3 -m venv "$INSTALL_DIR/.venv"
-"$INSTALL_DIR/.venv/bin/python" -m pip install --disable-pip-version-check -r "$INSTALL_DIR/requirements.txt"
+(
+  umask 022
+  python3 -m venv "$INSTALL_DIR/.venv"
+  "$INSTALL_DIR/.venv/bin/python" -m pip install --disable-pip-version-check -r "$INSTALL_DIR/requirements.txt"
+)
+# Also repair environments created by older installers with umask 077.
+# Add read/traverse access without granting write access or changing ownership.
+chmod -R go+rX "$INSTALL_DIR/.venv"
 cat > /etc/systemd/system/awscc-web.service <<UNIT
 [Unit]
 Description=AWS Control Center Web

@@ -34,7 +34,12 @@ PY
     cp -a "$src/static/." /opt/aws-control-center/static/
     install -m 0755 "$src/deploy/awscc" /usr/local/bin/awscc
     install -m 0755 "$src/deploy/awscc-resource-launcher.py" /opt/aws-control-center/resource-launcher.py
-    /opt/aws-control-center/.venv/bin/python -m pip install -r /opt/aws-control-center/requirements.txt
+    (
+      umask 022
+      /opt/aws-control-center/.venv/bin/python -m pip install -r /opt/aws-control-center/requirements.txt
+    )
+    # Repair old root-only venv files, including dependencies left unchanged by pip.
+    chmod -R go+rX /opt/aws-control-center/.venv
     if [[ ! -f /etc/systemd/system/awscc-task-worker.service ]]; then
       echo 'Installing task worker service (V6 migration)'
       sed 's@ExecStart=.*/worker.py@ExecStart=/opt/aws-control-center/.venv/bin/python taskqueue.py@;s@Description=AWS Control Center Monitor Worker@Description=AWS Control Center Create Task Worker@' /etc/systemd/system/awscc-worker.service > /etc/systemd/system/awscc-task-worker.service

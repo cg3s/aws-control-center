@@ -1,3 +1,4 @@
+import base64
 import json
 import pytest
 from fastapi import HTTPException
@@ -77,3 +78,59 @@ def test_password_template_applies_auth_policy_on_launch(control, monkeypatch):
     assert root['ssh_authorized_keys'] == [key] and root['lock_passwd'] is False
     assert sha512_crypt.verify(password, root['hashed_passwd'])
     assert 'PermitRootLogin yes' in config['runcmd'][0][2]
+
+
+def test_bootstrap_template_edit_updates_original_and_rejects_stale_writes(control):
+    _, client, headers, _ = control
+    key = public_key()
+    saved = client.post('/api/configurations', headers=headers, json={
+        'kind': 'bootstrap', 'name': 'original', 'payload': {'username': 'operator', 'ssh_public_key': key},
+    }).json()
+    path = '/api/configurations/' + saved['id']
+    changes = {'name': 'edited', 'version': saved['version'], 'payload': {
+        'ssh_public_key': key, 'root_login': 'password', 'password_auth': True, 'user_data': 'echo ready',
+        'firewall_rules': [{'protocol': 'tcp', 'from_port': 22, 'to_port': 22, 'cidr': '203.0.113.5/32'}],
+    }}
+    rejected = client.put(path, headers=headers, json={**changes, 'payload': {
+        **changes['payload'], 'root_password': 'instance-only-password',
+    }})
+    assert rejected.status_code == 400 and 'instance-only-password' not in rejected.text
+    response = client.put(path, headers=headers, json=changes)
+    assert response.status_code == 200, response.text
+    edited = response.json()
+    assert edited['id'] == saved['id'] and edited['created_at'] == saved['created_at']
+    assert edited['version'] == saved['version'] + 1 and edited['name'] == 'edited'
+    assert edited['payload'] == {**changes['payload'], 'username': ''}
+    assert client.put(path, headers=headers, json={**changes, 'name': 'stale'}).status_code == 409
+    assert client.get('/api/configurations?kind=bootstrap').json()['items'] == [edited]
+
+
+def test_bootstrap_template_edit_preserves_prepared_task(control, monkeypatch):
+    from botocore.exceptions import ClientError
+    from controlplane import resources
+    from test_tasks import request
+
+    web, client, headers, aws = control
+    original_rule = {'protocol': 'tcp', 'from_port': 22, 'to_port': 22, 'cidr': '203.0.113.5/32'}
+    saved = client.post('/api/configurations', headers=headers, json={
+        'kind': 'bootstrap', 'name': 'initial', 'payload': {'user_data': 'echo original', 'firewall_rules': [original_rule]},
+    }).json()
+    monkeypatch.setattr(resources, 'catalog', lambda *args: {'bundles': [{'id': 'micro', 'price_usd_per_month': 5}],
+                        'blueprints': [{'id': 'debian'}], 'zones': ['us-east-1a']})
+    aws.get_instance.side_effect = ClientError({'Error': {'Code': 'NotFoundException'}}, 'GetInstance')
+    job = request('create', bundle_id='micro', blueprint_id='debian', bootstrap_id=saved['id'])
+    preview = web.control_jobs.preview(job, 'tester')
+    updated_rule = {**original_rule, 'cidr': '203.0.113.8/32'}
+    edited = client.put('/api/configurations/' + saved['id'], headers=headers, json={
+        'name': saved['name'], 'version': saved['version'], 'payload': {'user_data': 'echo updated', 'firewall_rules': [updated_rule]},
+    })
+    assert edited.status_code == 200, edited.text
+    assert preview['items'][0]['firewall_rules'] == [original_rule]
+    assert web.control_jobs.preview(job, 'tester')['items'][0]['firewall_rules'] == [updated_rule]
+
+    job.preview_id, job.confirm = preview['preview_id'], preview['confirmation']
+    web.control_jobs.submit(job, 'tester')
+    assert web.control_jobs.run_once()
+    user_data = aws.create_instances.call_args.kwargs['userData']
+    assert base64.b64encode(b'echo original').decode() in user_data
+    assert base64.b64encode(b'echo updated').decode() not in user_data

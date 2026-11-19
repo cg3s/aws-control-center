@@ -89,6 +89,12 @@ class ConfigDocument(Strict):
     payload: dict
 
 
+class BootstrapUpdate(Strict):
+    name: str = Field(min_length=1, max_length=100)
+    version: int = Field(ge=1)
+    payload: dict
+
+
 class Connection(Strict):
     resource_key: str = Field(default='', max_length=500)
     username: str = Field(pattern=r'^[a-z_][a-z0-9_-]{0,31}$')

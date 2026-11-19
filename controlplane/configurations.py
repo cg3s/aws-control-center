@@ -16,6 +16,17 @@ def rule_profiles(payload):
     return set(selector['profiles']) if selector is not None else {target['profile'] for target in payload['targets']}
 
 
+def bootstrap_payload(fields):
+    try:
+        launch = Launch(**fields)
+    except ValidationError:
+        raise HTTPException(400, 'Invalid configuration fields') from None
+    if launch.root_password:
+        raise HTTPException(400, 'Saved templates cannot contain root passwords; set them per creation')
+    validate_launch(launch, template=True)
+    return launch.model_dump()
+
+
 class Configurations:
     def __init__(self, web, jobs):
         self.web, self.jobs = web, jobs
@@ -41,13 +52,11 @@ class Configurations:
 
     def save(self, data, actor):
         try:
-            model = {'bootstrap': Launch, 'connection': Connection, 'script': Script, 'rule': Rule}[data.kind](**data.payload)
-            payload = model.model_dump()
             if data.kind == 'bootstrap':
-                # Password input is supplied only per creation.
-                if payload.get('root_password'):
-                    raise HTTPException(400, 'Saved templates cannot contain root passwords; set them per creation')
-                validate_launch(model, template=True)
+                payload = bootstrap_payload(data.payload)
+            else:
+                model = {'connection': Connection, 'script': Script, 'rule': Rule}[data.kind]
+                payload = model(**data.payload).model_dump()
             if data.kind == 'connection' and not (payload['private_key'] or payload['password']):
                 raise HTTPException(400, 'Supply a private key or password')
             if data.kind == 'rule':
@@ -113,6 +122,25 @@ class Configurations:
         self.web.audit(actor, data.kind, profile=next(iter(profiles)) if len(profiles) == 1 else '',
                        resource=identifier, operation='save-version', detail=data.name)
         return self.public_document(document(self.web, identifier))
+
+
+    def update_bootstrap(self, identifier, data, actor):
+        payload = bootstrap_payload(data.payload)
+        encrypted = self.web.vault().encrypt(json.dumps(payload).encode())
+        with self.web.db() as c:
+            c.execute('BEGIN IMMEDIATE')
+            row = c.execute("SELECT * FROM v2_documents WHERE id=? AND kind='bootstrap'", (identifier,)).fetchone()
+            if row is None:
+                raise HTTPException(404, 'Configuration not found')
+            if row['version'] != data.version:
+                raise HTTPException(409, '模板版本已更新，请刷新页面后重新编辑。')
+            latest = c.execute("SELECT MAX(version) FROM v2_documents WHERE kind='bootstrap' AND name=?", (data.name,)).fetchone()[0]
+            version = max(row['version'], latest or 0) + 1
+            updated_at = stamp()
+            c.execute('UPDATE v2_documents SET name=?,version=?,payload=?,updated_at=? WHERE id=?',
+                      (data.name, version, encrypted, updated_at, identifier))
+        self.web.audit(actor, 'bootstrap', resource=identifier, operation='edit', detail=data.name)
+        return self.public_document(dict(row) | dict(name=data.name, version=version, payload=payload, updated_at=updated_at))
 
 
     def set_enabled(self, identifier, enabled, actor):

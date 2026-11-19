@@ -5,7 +5,7 @@ from . import resources, metrics
 from .jobs import Jobs
 from .configurations import Configurations, rule_profiles
 from .store import migrate, document, documents, stamp
-from .models import JobRequest, ConfigDocument
+from .models import BootstrapUpdate, JobRequest, ConfigDocument
 from .models import Strict
 from pydantic import Field
 
@@ -142,6 +142,10 @@ def register(web):
     @router.post('/configurations')
     def save(data: ConfigDocument, request: Request):
         return configs_service.save(data, web.ip_of(request))
+
+    @router.put('/configurations/{identifier}')
+    def update_bootstrap(identifier: str, data: BootstrapUpdate, request: Request):
+        return configs_service.update_bootstrap(identifier, data, web.ip_of(request))
 
     @router.post('/configurations/{identifier}/enabled')
     def enabled(identifier: str, request: Request, enabled: bool):

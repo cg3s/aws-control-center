@@ -1,5 +1,10 @@
 import React, {useEffect, useState} from 'react';
 import {createRoot} from 'react-dom/client';
+import {
+  ApartmentOutlined, AuditOutlined, BellOutlined, CloudServerOutlined, CodeOutlined, DashboardOutlined,
+  DollarCircleOutlined, FileTextOutlined, GlobalOutlined, KeyOutlined, LineChartOutlined,
+  PlusSquareOutlined, ScheduleOutlined, TeamOutlined,
+} from '@ant-design/icons';
 import {Alert, Button, Card, ConfigProvider, Input, Layout, Menu, Select, Space, Statistic, Table, theme} from 'antd';
 import type {MenuProps} from 'antd';
 import {api, post, qs, setCsrf, Filters, regionLabel} from './api';
@@ -12,34 +17,34 @@ import './style.css';
 const {Header, Sider, Content} = Layout;
 
 const menuItems: MenuProps['items'] = [
-  {key: 'overview', label: '总览'},
+  {key: 'overview', label: '总览', icon: <DashboardOutlined aria-hidden="true"/>},
   {
     type: 'group', key: 'resources-group', label: '资源管理', children: [
-      {key: 'resources', label: '实例管理'},
-      {key: 'create', label: '创建与初始化'},
-      {key: 'network', label: '网络与 IP'},
-      {key: 'accounts', label: 'AWS 账户'},
+      {key: 'resources', label: '实例管理', icon: <CloudServerOutlined aria-hidden="true"/>},
+      {key: 'create', label: '创建与初始化', icon: <PlusSquareOutlined aria-hidden="true"/>},
+      {key: 'network', label: '网络与 IP', icon: <GlobalOutlined aria-hidden="true"/>},
+      {key: 'accounts', label: 'AWS 账户', icon: <TeamOutlined aria-hidden="true"/>},
     ],
   },
   {
     type: 'group', key: 'monitoring-group', label: '监控与自动化', children: [
-      {key: 'traffic', label: '流量中心'},
-      {key: 'rule', label: '规则配置'},
-      {key: 'events', label: '触发与通知'},
+      {key: 'traffic', label: '流量中心', icon: <LineChartOutlined aria-hidden="true"/>},
+      {key: 'rule', label: '规则配置', icon: <ApartmentOutlined aria-hidden="true"/>},
+      {key: 'events', label: '触发与通知', icon: <BellOutlined aria-hidden="true"/>},
     ],
   },
   {
     type: 'group', key: 'tools-group', label: '工具与模板', children: [
-      {key: 'bootstrap', label: '初始化模板'},
-      {key: 'script', label: '脚本库'},
-      {key: 'connection', label: 'SSH 连接'},
+      {key: 'bootstrap', label: '初始化模板', icon: <FileTextOutlined aria-hidden="true"/>},
+      {key: 'script', label: '脚本库', icon: <CodeOutlined aria-hidden="true"/>},
+      {key: 'connection', label: 'SSH 连接', icon: <KeyOutlined aria-hidden="true"/>},
     ],
   },
   {
     type: 'group', key: 'operations-group', label: '运维管理', children: [
-      {key: 'tasks', label: '任务中心'},
-      {key: 'cost', label: '成本分析'},
-      {key: 'audit', label: '操作审计'},
+      {key: 'tasks', label: '任务中心', icon: <ScheduleOutlined aria-hidden="true"/>},
+      {key: 'cost', label: '成本分析', icon: <DollarCircleOutlined aria-hidden="true"/>},
+      {key: 'audit', label: '操作审计', icon: <AuditOutlined aria-hidden="true"/>},
     ],
   },
 ];

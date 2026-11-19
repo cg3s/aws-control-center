@@ -32,6 +32,7 @@ def migrate(web):
           attempted_at TEXT, updated_at TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS v2_pending ON v2_items(status,updated_at);
         CREATE INDEX IF NOT EXISTS v2_job_items ON v2_items(job_id);
+        CREATE INDEX IF NOT EXISTS v2_confirmed_deletions ON v2_items(target) WHERE kind='delete' AND status='succeeded';
         CREATE TABLE IF NOT EXISTS v2_workers(name TEXT PRIMARY KEY, seen_at TEXT NOT NULL, detail TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS v2_inventory(
           profile TEXT PRIMARY KEY, account_id TEXT, partition TEXT, fetched_at TEXT NOT NULL,

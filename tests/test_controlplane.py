@@ -27,6 +27,47 @@ def test_cached_inventory_deduplicates_account_aliases(control,monkeypatch):
     assert c.get('/api/dashboard/summary').json()['running'] == 1
 
 
+def test_manual_refresh_waits_for_selected_account_and_filters_terminated_instances(control, monkeypatch):
+    web, client, headers, _ = control
+    monkeypatch.setattr(web, 'available_profiles', lambda: ['default', 'other'])
+    scanned = []
+    stopped = {'id': 'i-stop', 'name': 'stopped', 'profile': 'default', 'region': 'us-east-1',
+               'service': 'ec2', 'state': 'stopped'}
+
+    def scan(**kwargs):
+        scanned.append(kwargs['profile'])
+        return {'items': [stopped, stopped | {'id': 'i-dead', 'state': 'terminated'}], 'errors': []}
+
+    monkeypatch.setattr(web, 'instances', scan)
+    with web.db() as conn:
+        # Also cover data cached by a version that did include terminated instances.
+        old = stopped | {'id': 'i-old', 'state': 'terminated', 'resource_key': 'aws/123456789012/us-east-1/ec2/i-old'}
+        conn.execute('INSERT INTO v2_inventory VALUES(?,?,?,?,?,?)',
+                     ('default', '123456789012', 'aws', '2000-01-01T00:00:00+00:00', json.dumps([old]), '[]'))
+    assert client.get('/api/resources?profiles=default').json()['items'] == []
+    result = client.post('/api/resources/refresh?profile=default', headers=headers)
+    assert result.json() == {'status': 'refreshed'}
+    assert scanned == ['default']
+    items = client.get('/api/resources?profiles=default').json()['items']
+    assert [(item['id'], item['state']) for item in items] == [('i-stop', 'stopped')]
+    assert client.post('/api/resources/refresh?profile=default', headers=headers).status_code == 429
+
+
+def test_slow_periodic_inventory_does_not_overwrite_a_newer_scan(control, monkeypatch):
+    web, client, _, _ = control
+    record = {'id': 'node', 'name': 'node', 'profile': 'default', 'region': 'us-east-1',
+              'service': 'lightsail', 'state': 'running'}
+
+    def slow_scan(**kwargs):
+        monkeypatch.setattr(web, 'instances', lambda **kw: {'items': [], 'errors': []})
+        assert resources.refresh_profile(web, kwargs['profile'])
+        return {'items': [record], 'errors': []}
+
+    monkeypatch.setattr(web, 'instances', slow_scan)
+    assert resources.refresh(web)
+    assert client.get('/api/resources').json()['items'] == []
+
+
 def test_sanitized_validation_does_not_echo_secrets(control):
     _,c,h,_=control
     secret='secret-never-echo-this'

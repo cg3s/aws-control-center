@@ -36,11 +36,8 @@ def run_once():
     with web.db() as c:
         c.execute("DELETE FROM v2_documents WHERE kind='preview' AND updated_at<?", (datetime.fromtimestamp(time.time()-3600, timezone.utc).isoformat(timespec='seconds'),))
         row = c.execute("SELECT seen_at FROM v2_workers WHERE name='inventory'").fetchone()
-        requested = c.execute("SELECT value FROM app_settings WHERE name='inventory_refresh'").fetchone()
-    if not row or time.time()-datetime.fromisoformat(row[0]).timestamp() >= 300 or (requested and requested[0] == 'true'):
+    if not row or time.time()-datetime.fromisoformat(row[0]).timestamp() >= 300:
         resources.refresh(web)
-        with web.db() as c:
-            c.execute("DELETE FROM app_settings WHERE name='inventory_refresh'")
     return metrics.run_once(web, web.control_jobs, telegram)
 
 

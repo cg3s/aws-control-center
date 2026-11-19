@@ -2,9 +2,10 @@ import json
 import threading
 from datetime import datetime, timezone
 from fastapi import HTTPException
-from .store import stamp, heartbeat
+from .store import heartbeat
 
 _refresh_lock = threading.Lock()
+DELETED_STATES = {'terminated', 'deleted'}
 
 
 def enabled_profiles(web, profiles=None):
@@ -44,28 +45,39 @@ def assert_identity(web, target):
         raise HTTPException(409, 'Credential now resolves to a different AWS account')
 
 
+def refresh_profile(web, profile):
+    # A slow periodic scan must not overwrite a newer manual scan of the same account.
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    try:
+        account, partition = identity(web, profile)
+        data = web.instances(profile=profile, region='all', service='all')
+    except Exception as exc:
+        errors = json.dumps([{'profile': profile, 'message': web.aws_error(exc)}])
+        with web.db() as c:
+            c.execute('''INSERT INTO v2_inventory VALUES(?,?,?,?,?,?) ON CONFLICT(profile) DO UPDATE SET
+                errors=excluded.errors WHERE v2_inventory.fetched_at<=excluded.fetched_at''',
+                (profile, '', '', fetched_at, '[]', errors))
+        return False
+    items = []
+    for item in data['items']:
+        if item['state'] in DELETED_STATES:
+            continue
+        key = '/'.join([partition, account, item['region'], item['service'], item['id']])
+        items.append(item | {'account_id': account, 'partition': partition, 'resource_key': key})
+    with web.db() as c:
+        c.execute('''INSERT INTO v2_inventory VALUES(?,?,?,?,?,?) ON CONFLICT(profile) DO UPDATE SET
+            account_id=excluded.account_id, partition=excluded.partition, fetched_at=excluded.fetched_at,
+            items=excluded.items, errors=excluded.errors WHERE v2_inventory.fetched_at<=excluded.fetched_at''',
+            (profile, account, partition, fetched_at, json.dumps(items), json.dumps(data['errors'])))
+    return True
+
+
 def refresh(web):
     if not _refresh_lock.acquire(blocking=False):
         return False
     try:
         for profile in enabled_profiles(web):
-            try:
-                account, partition = identity(web, profile)
-                data = web.instances(profile=profile, region='all', service='all')
-                for x in data['items']:
-                    x['account_id'], x['partition'] = account, partition
-                    x['resource_key'] = '/'.join([partition, account, x['region'], x['service'], x['id']])
-                with web.db() as c:
-                    c.execute('INSERT OR REPLACE INTO v2_inventory VALUES(?,?,?,?,?,?)',
-                              (profile, account, partition, stamp(), json.dumps(data['items']), json.dumps(data['errors'])))
-            except Exception as exc:
-                with web.db() as c:
-                    old = c.execute('SELECT profile FROM v2_inventory WHERE profile=?', (profile,)).fetchone()
-                    errors = json.dumps([{'profile': profile, 'message': web.aws_error(exc)}])
-                    if old:
-                        c.execute('UPDATE v2_inventory SET errors=? WHERE profile=?', (errors, profile))
-                    else:
-                        c.execute('INSERT INTO v2_inventory VALUES(?,?,?,?,?,?)', (profile, '', '', stamp(), '[]', errors))
+            refresh_profile(web, profile)
         heartbeat(web, 'inventory')
         return True
     finally:
@@ -81,6 +93,14 @@ def inventory(web, profiles='', region='all', service='all', search='', offset=0
         if group:
             chosen &= {r[0] for r in c.execute('SELECT profile FROM v2_account_settings WHERE group_name=?', (group,))}
         rows = c.execute('SELECT * FROM v2_inventory').fetchall()
+        deleted = set()
+        for record in c.execute("SELECT DISTINCT target FROM v2_items WHERE kind='delete' AND status='succeeded'"):
+            target = json.loads(record['target'])
+            key = '/'.join(target[field] for field in ('partition', 'account_id', 'region', 'service', 'instance'))
+            # EC2 IDs cannot be reused. Lightsail names can, so match the generation too.
+            generation = target.get('generation') if target['service'] == 'lightsail' else None
+            if target['service'] != 'lightsail' or generation:
+                deleted.add((key, generation))
     result, errors, seen, updates = [], [], set(), {}
     for row in rows:
         if row['profile'] not in chosen:
@@ -89,6 +109,9 @@ def inventory(web, profiles='', region='all', service='all', search='', offset=0
         errors.extend(json.loads(row['errors']))
         for x in json.loads(row['items']):
             key = x['resource_key']
+            generation = x.get('generation') if x['service'] == 'lightsail' else None
+            if x['state'] in DELETED_STATES or (key, generation) in deleted:
+                continue
             if key in seen or (region != 'all' and x['region'] != region) or (service != 'all' and x['service'] != service):
                 continue
             seen.add(key)

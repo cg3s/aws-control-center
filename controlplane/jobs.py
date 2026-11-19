@@ -430,7 +430,7 @@ class Jobs:
         if row['kind'] == 'reboot':
             return 'succeeded', result | {'state': current['state'], 'verification': 'request_accepted'}
         result |= {'state': current['state'], 'verified_at': stamp()}
-        if current['state'] == expected:
+        if current['state'] == expected or (row['kind'] == 'delete' and current['state'] in resources.DELETED_STATES):
             return 'succeeded', result
         attempted = datetime.fromisoformat(row['attempted_at'])
         if (datetime.now(timezone.utc)-attempted).total_seconds() > 1800:

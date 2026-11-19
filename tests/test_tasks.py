@@ -120,6 +120,40 @@ def test_delete_protection_and_confirmation(control):
     assert web.control_jobs.detail(task['id'])['status'] == 'succeeded'
 
 
+@pytest.mark.parametrize('service', ['ec2', 'lightsail'])
+def test_confirmed_deletion_hides_stale_inventory_but_keeps_replacements(control, monkeypatch, service):
+    web, client, _, aws = control
+    job = request('delete', service)
+    instance = job.items[0].target.instance
+    instance_generation = instance if service == 'ec2' else 'arn:node/2026-11-01'
+    cached = {'id': instance, 'profile': 'default', 'name': instance, 'region': 'us-east-1',
+              'service': service, 'state': 'running', 'generation': instance_generation}
+    monkeypatch.setattr(web, 'instances', lambda **kwargs: {'items': [cached], 'errors': []})
+    resources.refresh_profile(web, 'default')
+
+    queued = enqueue(web, job)
+    identifier = queued['id']
+    web.control_jobs.run_once()
+    assert client.get('/api/resources').json()['total'] == 1
+
+    if service == 'ec2':
+        aws.describe_instances.return_value['Reservations'][0]['Instances'][0]['State']['Name'] = 'terminated'
+    else:
+        aws.get_instance.side_effect = ClientError({'Error': {'Code': 'NotFoundException'}}, 'GetInstance')
+    ready(web, identifier)
+    web.control_jobs.run_once()
+    assert web.control_jobs.detail(identifier)['status'] == 'succeeded'
+
+    # Both the existing cache and a scan that still returns stale AWS data hide the deleted instance.
+    assert client.get('/api/resources').json()['items'] == []
+    resources.refresh_profile(web, 'default')
+    assert client.get('/api/dashboard/summary').json()['total'] == 0
+    if service == 'lightsail':
+        cached['generation'] = 'arn:node/2026-11-02'
+        resources.refresh_profile(web, 'default')
+        assert client.get('/api/resources').json()['items'][0]['generation'] == cached['generation']
+
+
 def test_lightsail_create_encryption_and_ownership(control, monkeypatch):
     web, _, _, aws = control
     monkeypatch.setattr(resources, 'catalog', lambda *a: {'bundles': [{'id': 'micro', 'price_usd_per_month': 5}],

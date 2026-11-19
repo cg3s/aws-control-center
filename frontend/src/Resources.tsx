@@ -23,6 +23,7 @@ export function Resources({filters, epoch, refresh}: {filters: Filters; epoch: n
   const [search, setSearch] = useState(''), [selected, setSelected] = useState<React.Key[]>([]);
   const [trafficResource, setTrafficResource] = useState<Resource>();
   const [trafficOpen, setTrafficOpen] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [scriptId, setScriptId] = useState(''), [connectionId, setConnectionId] = useState(''), [parameters,setParameters] = useState('');
   const {data, error, loading} = useRemote<{items: Resource[]; errors: unknown[]; updated_at: object}>('/resources?' + qs({profiles: filters.profile, region: filters.region, service: filters.service, search, limit: '500'}), epoch);
   const scripts = useRemote<{items: {id: string; name: string; version: number}[]}>('/configurations?kind=script', epoch);
@@ -36,7 +37,16 @@ export function Resources({filters, epoch, refresh}: {filters: Filters; epoch: n
   const target = (x: Resource): Target => ({profile: x.profile, region: x.region, service: x.service, instance: x.id, account_id: x.account_id, partition: x.partition});
   const chosen = () => (data?.items ?? []).filter(x => selected.includes(x.resource_key));
   const run = (kind: string, rows = chosen()) => void attempt(async()=>{await jobs.submit(rows.map(x => ({kind, target: target(x), script_id: scriptId, connection_id: connectionId,parameters:kind==='script'&&parameters?JSON.parse(parameters):{}})));});
-  return <><Card title="实例管理" extra={<Button onClick={() => void attempt(async () => {await post('/resources/refresh'); message.success('已请求后台刷新');})}>刷新 AWS 清单</Button>}>
+  const refreshInventory = () => void attempt(async () => {
+    setRefreshing(true);
+    try {
+      await post('/resources/refresh?' + qs({profile: filters.profile}));
+    } finally {
+      refresh();
+      setRefreshing(false);
+    }
+  });
+  return <><Card title="实例管理" extra={<Button loading={refreshing} onClick={refreshInventory}>刷新 AWS 清单</Button>}>
     <Space wrap className="filters"><Input.Search placeholder="搜索名称、IP 或标签" onSearch={setSearch} allowClear/>{['start', 'stop', 'reboot', 'delete'].map((kind, i) => <Button key={kind} danger={kind === 'delete'} disabled={!selected.length} loading={jobs.busy} onClick={() => run(kind)}>{['批量启动', '批量停止', '批量重启', '批量删除'][i]}</Button>)}</Space>
     <ErrorBox error={error}/>{!!data?.errors.length && <Alert type="warning" message="部分账户或区域查询失败" description={JSON.stringify(data.errors)}/>}
     <Table loading={loading} rowKey="resource_key" dataSource={data?.items} pagination={{pageSize: 20}} scroll={{x: 1300}}

@@ -94,7 +94,7 @@ sudo awscc upgrade /path/to/aws-control-center
 | --- | --- |
 | `/api/login`、`/api/session`、`/api/logout` | 登录、会话与 CSRF |
 | `/api/key-accounts`、`/api/accounts`、`/api/account-settings` | 凭据、角色、分组和启用状态 |
-| `/api/resources`、`/api/resources/refresh` | 缓存查询与请求刷新 |
+| `/api/resources`、`/api/resources/refresh` | 查询清单缓存，或立即从 AWS 刷新当前账户 |
 | `/api/catalog` | 区域创建选项 |
 | `/api/tasks/preview`、`/api/tasks` | 固定预览与确认入队 |
 | `/api/tasks/{id}`、`cancel`、`verify` 子路径 | 任务详情、取消与核验 |

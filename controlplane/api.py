@@ -1,6 +1,5 @@
 import json
 import time
-from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from . import resources, metrics
 from .jobs import Jobs
@@ -52,14 +51,23 @@ def register(web):
         return resources.inventory(web, profiles, region, service, search, offset, limit, group)
 
     @router.post('/resources/refresh')
-    def refresh(request: Request):
+    def refresh(request: Request, profile: str | None = None):
+        profile = web.require_selected_profile(profile)
+        if profile not in resources.enabled_profiles(web):
+            raise HTTPException(400, 'Unknown or disabled account')
+        key = 'inventory_refresh:' + profile
+        now = time.time()
         with web.db() as c:
-            row = c.execute("SELECT seen_at FROM v2_workers WHERE name='inventory'").fetchone()
-            if row and time.time()-datetime.fromisoformat(row[0]).timestamp() < 30:
-                raise HTTPException(429, 'Inventory refresh is limited to once every 30 seconds')
-            c.execute("INSERT OR REPLACE INTO app_settings VALUES('inventory_refresh','true')")
-        web.audit(web.ip_of(request), 'inventory', operation='refresh')
-        return {'status': 'queued'}
+            c.execute('BEGIN IMMEDIATE')
+            row = c.execute('SELECT value FROM app_settings WHERE name=?', (key,)).fetchone()
+            if row and now - float(row['value']) < 30:
+                raise HTTPException(429, '请等待 30 秒后再刷新此账户的清单')
+            c.execute('INSERT OR REPLACE INTO app_settings VALUES(?,?)', (key, str(now)))
+        refreshed = resources.refresh_profile(web, profile)
+        web.audit(web.ip_of(request), 'inventory', profile=profile, operation='refresh', result='ok' if refreshed else 'failed')
+        if not refreshed:
+            raise HTTPException(502, 'AWS 清单刷新失败，已保留上次结果')
+        return {'status': 'refreshed'}
 
     @router.get('/catalog')
     def catalog(profile: str, region: str, service: str):

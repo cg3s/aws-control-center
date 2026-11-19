@@ -88,6 +88,76 @@ def test_disabled_accounts_block_writes_and_remain_manageable(control):
     assert c.get('/api/resources').json()['total']==0
 
 
+def test_activate_and_disable_configured_profiles(control, monkeypatch):
+    web, client, headers, _ = control
+    monkeypatch.setattr(web, 'base_profiles', lambda: ['staging', 'production'])
+    with web.db() as conn:
+        conn.execute("INSERT INTO app_settings VALUES('active_profile', 'default')")
+    assert client.get('/api/config').json()['active_profile'] is None
+    for profile in ('staging', 'production'):
+        result = client.post('/api/key-accounts/activate', headers=headers, json={'alias': profile})
+        assert result.json()['active_profile'] == profile
+        assert client.get('/api/config').json()['active_profile'] == profile
+    client.post('/api/account-settings', headers=headers, json={'profile': 'production', 'enabled': False})
+    assert client.get('/api/config').json()['active_profile'] is None
+    assert client.post('/api/key-accounts/activate', headers=headers, json={'alias': 'production'}).status_code == 409
+    assert client.get('/api/config').json()['profiles'] == ['staging', 'production']
+
+
+def test_scoped_task_cancel_and_audit(control, monkeypatch):
+    web, client, headers, _ = control
+    from controlplane.models import JobItem
+
+    monkeypatch.setattr(web, 'base_profiles', lambda: ['staging', 'production'])
+    options = {'region': 'us-east-1', 'service': 'lightsail', 'instance': 'node'}
+    items = [web.control_jobs.prepare(JobItem(kind='stop', target={**options, 'profile': profile}))
+             for profile in ('staging', 'production')]
+    task = web.control_jobs.enqueue(items, 'mixed-account-test', 'mixed', 'test')
+    identifier = task['id']
+    listed = client.get('/api/tasks?profile=production').json()['items']
+    assert [item['target']['profile'] for item in listed[0]['items']] == ['production']
+    assert client.get('/api/tasks?profile=other').json()['items'] == []
+    result = client.post(f'/api/tasks/{identifier}/cancel?profile=production', headers=headers)
+    assert result.json()['status'] == 'canceled'
+    assert web.control_jobs.detail(identifier, 'staging')['status'] == 'queued'
+    audit = client.get('/api/audit?profile=production').json()['items']
+    assert [(row['profile'], row['operation']) for row in audit] == [('production', 'cancel')]
+
+
+def test_events_scope_hides_other_targets_and_deliveries(control):
+    web, client, _, _ = control
+    from controlplane.store import stamp
+
+    staging = {'profile': 'staging', 'instance': 'test'}
+    production = {'profile': 'production', 'instance': 'prod'}
+    with web.db() as conn:
+        for event_id, targets in [('mixed', [staging, production]), ('test-only', staging), ('prod-only', production)]:
+            conn.execute('INSERT INTO v2_events VALUES(?,?,?,?,?,?,?)',
+                         (event_id, 'rule', json.dumps(targets), stamp(), 10, None, '{}'))
+            conn.execute('INSERT INTO v2_deliveries(id, message) VALUES(?,?)', (event_id, 'notice'))
+    events = client.get('/api/events?profile=production').json()
+    assert {row['id'] for row in events['deliveries']} == {'mixed', 'prod-only'}
+    assert {row['id'] for row in events['items']} == {'mixed', 'prod-only'}
+    mixed = next(row for row in events['items'] if row['id'] == 'mixed')
+    assert json.loads(mixed['target']) == [production]
+    assert mixed['value'] is None
+
+
+def test_same_rule_name_is_versioned_per_account(control, monkeypatch):
+    web, client, headers, _ = control
+    monkeypatch.setattr(web, 'base_profiles', lambda: ['staging', 'production'])
+    for profile in ('staging', 'production', 'production'):
+        payload = {'targets': [{'profile': profile, 'region': 'us-east-1', 'service': 'lightsail', 'instance': 'node'}],
+                   'threshold': 1}
+        result = client.post('/api/configurations', headers=headers,
+                             json={'kind': 'rule', 'name': 'traffic-limit', 'payload': payload})
+        assert result.status_code == 200, result.text
+    staging = client.get('/api/configurations?kind=rule&profile=staging').json()['items']
+    production = client.get('/api/configurations?kind=rule&profile=production').json()['items']
+    assert [(row['version'], row['payload']['enabled']) for row in staging] == [(1, True)]
+    assert {row['version']: row['payload']['enabled'] for row in production} == {1: False, 2: True}
+
+
 def test_inventory_capacity_20_accounts_500_instances(control,monkeypatch):
     web,c,_,_=control
     profiles=['account'+str(i) for i in range(20)]

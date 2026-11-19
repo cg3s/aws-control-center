@@ -23,6 +23,8 @@ def env(tmp_path, monkeypatch):
 
 def stub_sts(app, monkeypatch):
     def mock_session(**kwargs):
+        if not kwargs:
+            return MagicMock(available_profiles=[])
         assert kwargs['aws_access_key_id'] == 'AKIA'+'A'*16
         assert kwargs['aws_secret_access_key'] == 'b'*40
         ses = MagicMock()
@@ -35,14 +37,16 @@ def stub_sts(app, monkeypatch):
 
 def test_key_crud_activate_and_no_leak(env, monkeypatch):
     app, client, headers, path = env
-    monkeypatch.setattr(app, 'base_profiles', lambda:['default'])
     stub_sts(app,monkeypatch)
+    assert client.get('/api/config').json()['profiles'] == []
+    assert client.get('/api/identity').status_code == 400
     data = {'alias':'prod1','access_key_id':'AKIA'+'A'*16,'secret_access_key':'b'*40}
     assert client.post('/api/key-accounts',json=data).status_code==403
     r=client.post('/api/key-accounts',json=data,headers=headers)
     assert r.status_code==200,r.text
     assert 'secret' not in r.text
-    assert client.get('/api/config').json()['active_profile']=='default'
+    assert client.get('/api/config').json()['active_profile'] is None
+    assert client.get('/api/config').json()['profiles'] == ['prod1']
     entries=client.get('/api/key-accounts').json()['items']
     assert len(entries)==1 and entries[0]['access_key_tail']=='AAAA'
     assert data['secret_access_key'] not in repr(entries)
@@ -55,10 +59,12 @@ def test_key_crud_activate_and_no_leak(env, monkeypatch):
     r=client.post('/api/key-accounts/activate',json={'alias':'prod1'},headers=headers)
     assert r.status_code==200
     assert client.get('/api/config').json()['active_profile']=='prod1'
+    assert client.get('/api/identity').json()['Account'] == '123456789012'
     assert app.aws_session('prod1')
     assert client.post('/api/key-accounts/prod1/verify',headers=headers).status_code==200
     assert client.delete('/api/key-accounts/prod1',headers=headers).status_code==200
-    assert client.get('/api/config').json()['active_profile']=='default'
+    assert client.get('/api/config').json()['active_profile'] is None
+    assert client.get('/api/config').json()['profiles'] == []
 
 
 def test_reject_invalid_and_duplicate(env,monkeypatch):

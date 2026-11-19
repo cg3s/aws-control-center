@@ -242,42 +242,56 @@ class Jobs:
                         x['aws_args']['tags'].append({'key': 'awscc-task', 'value': item_id})
                 c.execute('INSERT INTO v2_items(id,job_id,kind,target,payload,status,updated_at) VALUES(?,?,?,?,?,?,?)',
                           (item_id, identifier, x['kind'], encode(x['target']), w.vault().encrypt(encode(x).encode()), 'queued', now))
-        w.audit(actor, 'task', resource=identifier, operation='enqueue', detail=f'{len(items)} items')
+        profiles = {item['target']['profile'] for item in items}
+        w.audit(actor, 'task', profile=next(iter(profiles)) if len(profiles) == 1 else '',
+                resource=identifier, operation='enqueue', detail=f'{len(items)} items')
         return self.detail(identifier)
 
-    def detail(self, identifier):
+    def detail(self, identifier, profile=None):
         with self.web.db() as c:
             row = c.execute('SELECT * FROM v2_jobs WHERE id=?', (identifier,)).fetchone()
             if not row:
                 raise HTTPException(404, 'Task not found')
-            items = [dict(r) for r in c.execute('SELECT id,kind,target,status,result,error,attempted_at,updated_at FROM v2_items WHERE job_id=? ORDER BY rowid', (identifier,))]
+            items = [dict(r) for r in c.execute('''SELECT id,kind,target,status,result,error,attempted_at,updated_at
+                FROM v2_items WHERE job_id=? AND (? IS NULL OR json_extract(target,'$.profile')=?) ORDER BY rowid''',
+                (identifier, profile, profile))]
+        if profile is not None and not items:
+            raise HTTPException(404, 'Task not found for this account')
         for x in items:
             x['target'], x['result'] = json.loads(x['target']), json.loads(x['result'])
-        return dict(row) | {'items': items}
+        return dict(row) | {'items': items, 'status': self.status_from_items([i['status'] for i in items]) if profile is not None else row['status']}
+
+    @staticmethod
+    def status_from_items(states):
+        if states and all(state == 'queued' for state in states):
+            return 'queued'
+        if any(state not in TERMINAL for state in states):
+            return 'running'
+        return states[0] if len(set(states)) == 1 else 'partial'
 
     def summarize(self, c, job_id):
         states = [r[0] for r in c.execute('SELECT status FROM v2_items WHERE job_id=?', (job_id,))]
-        status = ('queued' if states and all(s == 'queued' for s in states) else
-                  'running' if any(s not in TERMINAL for s in states) else
-                  states[0] if len(set(states)) == 1 else 'partial')
-        c.execute('UPDATE v2_jobs SET status=?,updated_at=? WHERE id=?', (status, stamp(), job_id))
+        c.execute('UPDATE v2_jobs SET status=?,updated_at=? WHERE id=?', (self.status_from_items(states), stamp(), job_id))
 
-    def cancel(self, identifier, actor):
-        if self.detail(identifier)['status'] == 'archived':
+    def cancel(self, identifier, actor, profile=None):
+        if self.detail(identifier, profile)['status'] == 'archived':
             raise HTTPException(409, 'Historical tasks are read-only')
         with self.web.db() as c:
-            c.execute("UPDATE v2_items SET status='canceled',updated_at=? WHERE job_id=? AND status='queued'", (stamp(), identifier))
+            c.execute("""UPDATE v2_items SET status='canceled',updated_at=? WHERE job_id=? AND status='queued'
+                         AND (? IS NULL OR json_extract(target,'$.profile')=?)""", (stamp(), identifier, profile, profile))
             self.summarize(c, identifier)
-        self.web.audit(actor, 'task', resource=identifier, operation='cancel')
-        return self.detail(identifier)
+        self.web.audit(actor, 'task', profile=profile or '', resource=identifier, operation='cancel')
+        return self.detail(identifier, profile)
 
-    def verify(self, identifier, actor):
-        if self.detail(identifier)['status'] == 'archived':
+    def verify(self, identifier, actor, profile=None):
+        if self.detail(identifier, profile)['status'] == 'archived':
             raise HTTPException(409, 'Inspect historical instances from the resource list')
         with self.web.db() as c:
-            c.execute("UPDATE v2_items SET status='verifying',lease_until=NULL WHERE job_id=? AND status IN ('submitted','unknown') AND kind NOT IN ('script','bootstrap_verify')", (identifier,))
-        self.web.audit(actor, 'task', resource=identifier, operation='verify')
-        return self.detail(identifier)
+            c.execute("""UPDATE v2_items SET status='verifying',lease_until=NULL WHERE job_id=?
+                AND status IN ('submitted','unknown') AND kind NOT IN ('script','bootstrap_verify')
+                AND (? IS NULL OR json_extract(target,'$.profile')=?)""", (identifier, profile, profile))
+        self.web.audit(actor, 'task', profile=profile or '', resource=identifier, operation='verify')
+        return self.detail(identifier, profile)
 
     def run_once(self):
         w, owner = self.web, str(uuid4())

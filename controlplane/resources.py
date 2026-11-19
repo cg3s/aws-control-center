@@ -7,10 +7,10 @@ from .store import stamp, heartbeat
 _refresh_lock = threading.Lock()
 
 
-def enabled_profiles(web):
+def enabled_profiles(web, profiles=None):
     with web.db() as c:
         disabled = {r[0] for r in c.execute('SELECT profile FROM v2_account_settings WHERE enabled=0')}
-    return [p for p in web.available_profiles() if p not in disabled]
+    return [p for p in (web.available_profiles() if profiles is None else profiles) if p not in disabled]
 
 
 def identity(web, profile):

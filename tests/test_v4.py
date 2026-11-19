@@ -10,7 +10,7 @@ def test_static_ip_list_and_actions(setup, monkeypatch):
     aws.get_static_ips.return_value = {'staticIps': [{'name':'ip1', 'ipAddress':'1.2.3.4','isAttached':False}]}
     aws.get_static_ip.return_value = {'staticIp': {'isAttached': False}}
     monkeypatch.setattr(app, 'client', lambda *a: aws)
-    assert c.get('/api/lightsail/static-ips?region=us-east-1').json()['items'][0]['name'] == 'ip1'
+    assert c.get('/api/lightsail/static-ips?profile=default&region=us-east-1').json()['items'][0]['name'] == 'ip1'
     payload = {'profile':'default','region':'us-east-1','name':'ip1','action':'release'}
     assert c.post('/api/lightsail/static-ip/action',headers=h,json=payload).status_code == 400
     assert c.post('/api/lightsail/static-ip/action',headers=h,json={**payload,'confirm':'ip1'}).status_code == 200

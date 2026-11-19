@@ -39,7 +39,7 @@ npm run build
 ssh -L 8000:127.0.0.1:8000 USER@SERVER_IP
 ```
 
-浏览器打开 `http://127.0.0.1:8000`。Docker 密码在项目 `.env`，原生密码在 `/etc/aws-control-center/awscc.env`。登录后在“AWS 账户”添加 Access Key 或角色账户，等待后台清单更新；不需要提前准备 `.aws` 文件夹。
+浏览器打开 `http://127.0.0.1:8000`。Docker 密码在项目 `.env`，原生密码在 `/etc/aws-control-center/awscc.env`。登录后在“AWS 账户”添加凭据，然后在顶部账户列表点击“激活”。业务页直接使用当前账户。使用 Access Key 时无需提前准备 `.aws` 文件夹。
 
 使用 HTTPS 反代时将 `COOKIE_SECURE=true` 写入对应配置并重启。实例创建、删除与自动化执行均在界面中单独确认和配置。
 

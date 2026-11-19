@@ -5,12 +5,16 @@ import {api, post, JobItem, Task} from './api';
 export async function attempt(work: () => Promise<unknown>) {
   try { await work(); } catch (e) { message.error(String(e)); }
 }
-export function useRemote<T>(path: string, epoch = 0) {
+export function useRemote<T>(path: string | null, epoch = 0) {
   const [data, setData] = useState<T>(), [error, setError] = useState(''), [loading, setLoading] = useState(false);
   const previousPath = useRef(path);
   useEffect(() => {
     let active = true; setLoading(true); setError('');
     if(previousPath.current!==path){setData(undefined);previousPath.current=path;}
+    if (path === null) {
+      setLoading(false);
+      return;
+    }
     void api<T>(path).then(d => {if (active) setData(d);}).catch(e => {if (active) setError(String(e));}).finally(() => {if (active) setLoading(false);});
     return () => {active = false;};
   }, [path, epoch]);

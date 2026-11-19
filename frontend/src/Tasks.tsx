@@ -12,14 +12,14 @@ export function Create({filters, refresh, epoch}: {filters: Filters; refresh: ()
   const [form] = Form.useForm();
   const templates = useRemote<{items: Configuration[]}>('/configurations?kind=bootstrap', epoch);
   const jobs = useTaskSubmission(() => {form.resetFields([['launch', 'root_password']]); refresh();});
-  const specific = filters.profile !== 'all' && filters.region !== 'all';
+  const specific = filters.region !== 'all';
   const subnet = Form.useWatch('subnet_id', form), vpc = catalog?.subnets?.find(x => x.SubnetId === subnet)?.VpcId;
   const load = async () => {
     setError(''); setLoading(true); setCatalog(undefined);
     try {setCatalog(await api<Catalog>('/catalog?' + qs({profile: filters.profile, region: filters.region, service})));}
     catch (e) {setError(String(e));} finally {setLoading(false);}
   };
-  return <Card title="创建实例与 DIY 初始化"><Alert type="info" message="选择具体账户和区域后加载选项。启动模板版本必须固定；root 配置适用于 Linux。"/><Space className="section"><Select value={service} onChange={s => {setService(s); setCatalog(undefined); form.resetFields();}} options={['lightsail', 'ec2'].map(value => ({value, label: value}))}/><Button disabled={!specific} loading={loading} onClick={() => void load()}>加载区域选项</Button></Space><ErrorBox error={error}/>
+  return <Card title="创建实例与 DIY 初始化"><Alert type="info" message="选择具体区域后加载选项。启动模板版本必须固定；root 配置适用于 Linux。"/><Space className="section"><Select value={service} onChange={s => {setService(s); setCatalog(undefined); form.resetFields();}} options={['lightsail', 'ec2'].map(value => ({value, label: value}))}/><Button disabled={!specific} loading={loading} onClick={() => void load()}>加载区域选项</Button></Space><ErrorBox error={error}/>
     <Form form={form} layout="vertical" className="section" initialValues={{disk_gib: 20, public_ip: false, launch: {root_login: 'disabled', password_auth: false}}}
       onFinish={(values: Values) => void attempt(async () => {
         const {names, tags_json, ...options} = values;
@@ -50,15 +50,15 @@ export function Create({filters, refresh, epoch}: {filters: Filters; refresh: ()
     </Form>{jobs.modal}</Card>;
 }
 
-export function Tasks({epoch, refresh}: {epoch: number; refresh: () => void}) {
-  const {data, error, loading} = useRemote<{items: Task[]}>('/tasks', epoch);
+export function Tasks({profile, epoch, refresh}: {profile: string; epoch: number; refresh: () => void}) {
+  const {data, error, loading} = useRemote<{items: Task[]}>('/tasks?'+qs({profile}), epoch);
   const [output, setOutput] = useState('');
   return <><Card title="任务中心"><ErrorBox error={error}/><Table loading={loading} rowKey="id" pagination={{pageSize: 15}} dataSource={data?.items} columns={[
     {title: '任务', dataIndex: 'id'}, {title: '状态', dataIndex: 'status', render: v => <Tag>{v}</Tag>}, {title: '来源', dataIndex: 'actor'}, {title: '创建时间', dataIndex: 'created_at'},
-    {title: '操作', render: (_, x) => <Space><Button onClick={() => void attempt(async () => {await post('/tasks/'+x.id+'/verify'); refresh();})}>核验</Button><Button danger onClick={() => void attempt(async () => {await post('/tasks/'+x.id+'/cancel'); refresh();})}>取消未提交项</Button></Space>},
+    {title: '操作', render: (_, x) => <Space><Button onClick={() => void attempt(async () => {await post('/tasks/'+x.id+'/verify?'+qs({profile})); refresh();})}>核验</Button><Button danger onClick={() => void attempt(async () => {await post('/tasks/'+x.id+'/cancel?'+qs({profile})); refresh();})}>取消未提交项</Button></Space>},
   ]} expandable={{expandedRowRender: x => <Table rowKey="id" size="small" pagination={false} dataSource={x.items} columns={[
     {title: '操作', dataIndex: 'kind'}, {title: '目标', render: (_, i) => `${i.target.profile}/${i.target.region}/${i.target.instance}`}, {title: '状态', dataIndex: 'status'}, {title: '错误', dataIndex: 'error'},
     {title: '结果', render: (_, i) => <Descriptions column={1} items={Object.entries(i.result).map(([k, v]) => ({key: k, label: k, children: String(v)}))}/>},
-    {title: '输出', render: (_, i) => i.result.output_available ? <Button onClick={() => void attempt(async () => setOutput(JSON.stringify(await api('/task-items/'+i.id+'/output'), null, 2)))}>查看输出</Button> : null},
+    {title: '输出', render: (_, i) => i.result.output_available ? <Button onClick={() => void attempt(async () => setOutput(JSON.stringify(await api('/task-items/'+i.id+'/output?'+qs({profile})), null, 2)))}>查看输出</Button> : null},
   ]}/>}}/></Card>{output && <Card title="脚本输出（最多各 32 KiB，可能包含脚本输出的秘密）" className="section" extra={<Button onClick={() => setOutput('')}>关闭</Button>}><pre className="detail">{output}</pre></Card>}</>;
 }

@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import sqlite3
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -21,6 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 from controlplane.store import ClosingConnection
+from controlplane.resources import enabled_profiles
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv('DATA_DIR', str(ROOT / 'data')))
@@ -132,7 +134,7 @@ def auth(request: Request):
 
 
 def base_profiles():
-    return ['default'] + [p for p in boto3.Session().available_profiles if p != 'default']
+    return list(boto3.Session().available_profiles)
 
 
 def accounts():
@@ -172,11 +174,21 @@ def saved_keys():
                                           FROM key_accounts ORDER BY alias''').fetchall()]
 
 
-def active_profile():
+def active_profile(profiles: list[str] | None = None):
     with db() as c:
         row = c.execute("SELECT value FROM app_settings WHERE name='active_profile'").fetchone()
-    selected = row['value'] if row else 'default'
-    return selected if selected in available_profiles() else 'default'
+    if row is None:
+        return None
+    if profiles is None:
+        profiles = enabled_profiles(sys.modules[__name__])
+    return row['value'] if row['value'] != 'all' and row['value'] in profiles else None
+
+
+def require_selected_profile(profile: str | None):
+    selected = profile if profile is not None else active_profile()
+    if selected is None:
+        raise HTTPException(400, 'Select or activate an AWS account first')
+    return selected
 
 
 def available_profiles():
@@ -199,7 +211,7 @@ def valid_profile(profile):
 def aws_session(profile):
     kind, item = valid_profile(profile)
     if kind == 'base':
-        return boto3.Session() if item == 'default' else boto3.Session(profile_name=item)
+        return boto3.Session(profile_name=item)
     if kind == 'key':
         with db() as c:
             row = c.execute('SELECT secret_encrypted FROM key_accounts WHERE alias=?', (profile,)).fetchone()
@@ -335,7 +347,9 @@ def logout(request: Request, response: Response):
 
 @app.get('/api/config', dependencies=[Depends(auth)])
 def config():
-    return {'profiles': available_profiles(), 'active_profile': active_profile(), 'regions': REGIONS}
+    profiles = available_profiles()
+    enabled = enabled_profiles(sys.modules[__name__], profiles)
+    return {'profiles': profiles, 'active_profile': active_profile(enabled), 'regions': REGIONS}
 
 
 @app.get('/api/accounts', dependencies=[Depends(auth)])
@@ -368,6 +382,8 @@ def remove_account(alias: str, request: Request):
     check_account_dependencies(alias)
     with db() as c:
         count = c.execute('DELETE FROM accounts WHERE alias=?', (alias,)).rowcount
+        if count:
+            c.execute("DELETE FROM app_settings WHERE name='active_profile' AND value=?", (alias,))
     if not count:
         raise HTTPException(404, 'Account not found')
     audit(ip_of(request), 'account', profile=alias, operation='delete')
@@ -384,7 +400,7 @@ def list_key_accounts():
 
 @app.post('/api/key-accounts', dependencies=[Depends(auth)])
 def create_key_account(item: KeyAccountIn, request: Request):
-    if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{1,39}', item.alias):
+    if item.alias == 'all' or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{1,39}', item.alias):
         raise HTTPException(400, 'Invalid account alias')
     if item.alias in available_profiles():
         raise HTTPException(409, 'Account alias already exists')
@@ -428,8 +444,14 @@ def verify_key_account(alias: str, request: Request):
 @app.post('/api/key-accounts/activate', dependencies=[Depends(auth)])
 def activate_key_account(item: ActivateAccountIn, request: Request):
     # Activation is server-persisted; existing in-flight operations keep their explicit profile.
+    if item.alias == 'all':
+        raise HTTPException(400, 'Select an individual AWS account')
     valid_profile(item.alias)
     with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        disabled = c.execute('SELECT 1 FROM v2_account_settings WHERE profile=? AND enabled=0', (item.alias,)).fetchone()
+        if disabled:
+            raise HTTPException(409, 'Enable this AWS account before activating it')
         c.execute('''INSERT INTO app_settings(name,value) VALUES('active_profile',?)
                      ON CONFLICT(name) DO UPDATE SET value=excluded.value''',(item.alias,))
     audit(ip_of(request), 'account', profile=item.alias, operation='activate')
@@ -443,15 +465,15 @@ def delete_key_account(alias: str, request: Request):
         count = c.execute('DELETE FROM key_accounts WHERE alias=?',(alias,)).rowcount
         if not count:
             raise HTTPException(404, 'Saved credential not found')
-        c.execute("UPDATE app_settings SET value='default' WHERE name='active_profile' AND value=?",(alias,))
+        c.execute("DELETE FROM app_settings WHERE name='active_profile' AND value=?",(alias,))
     audit(ip_of(request), 'credential', profile=alias, operation='delete')
     return {'ok':True, 'active_profile':active_profile()}
 
 
 @app.get('/api/identity', dependencies=[Depends(auth)])
-def identity(profile: str = 'default'):
+def identity(profile: str | None = None):
     try:
-        return aws_session(profile).client('sts', config=AWS_CONFIG).get_caller_identity()
+        return aws_session(require_selected_profile(profile)).client('sts', config=AWS_CONFIG).get_caller_identity()
     except (ClientError, BotoCoreError) as e:
         raise HTTPException(502, aws_error(e))
 
@@ -497,7 +519,7 @@ def scan_one(session, profile, region, service):
     return rows, failures
 
 
-def instances(profile: str = 'default', service: str = 'all', region: str = 'all'):
+def instances(profile: str, service: str = 'all', region: str = 'all'):
     if service not in ('all', 'lightsail', 'ec2'):
         raise HTTPException(400, 'Unsupported service')
     chosen = REGIONS if region == 'all' else [region]
@@ -522,18 +544,19 @@ def instances(profile: str = 'default', service: str = 'all', region: str = 'all
 
 
 @app.get('/api/audit', dependencies=[Depends(auth)])
-def audit_list(limit: int = 100):
+def audit_list(limit: int = 100, profile: str | None = None):
     if not 1 <= limit <= 500:
         raise HTTPException(400, 'Limit must be 1..500')
     with db() as c:
-        return {'items': [dict(r) for r in c.execute('SELECT * FROM audit ORDER BY id DESC LIMIT ?', (limit,))]}
+        return {'items': [dict(r) for r in c.execute('''SELECT * FROM audit WHERE (? IS NULL OR profile=?)
+                    ORDER BY id DESC LIMIT ?''', (profile, profile, limit))]}
 
 
 @app.get('/api/cost', dependencies=[Depends(auth)])
-def costs(profile: str = 'default'):
-    import sys
+def costs(profile: str | None = None):
     from controlplane.reports import costs as report
-    return report(sys.modules[__name__], profile, _fetch_costs)
+    selected = profile if profile is not None else active_profile() or 'all'
+    return report(sys.modules[__name__], selected, _fetch_costs)
 
 
 def _fetch_costs(profile):
@@ -597,10 +620,10 @@ def ip_check(data: IpCheck, request: Request):
 
 # V4: Lightsail static IP operations. Explicit confirmation for destructive release.
 @app.get('/api/lightsail/static-ips', dependencies=[Depends(auth)])
-def static_ips(profile: str = 'default', region: str = ''):
+def static_ips(profile: str | None = None, region: str = ''):
     check_region(region)
     try:
-        api = client(profile, 'lightsail', region)
+        api = client(require_selected_profile(profile), 'lightsail', region)
         items, token = [], None
         for _ in range(30):
             kw = {'pageToken': token} if token else {}
@@ -719,6 +742,5 @@ def check_account_dependencies(alias):
         if any(t['profile'] == alias for t in rule['payload']['targets']):
             raise HTTPException(409, 'Remove account monitoring rules first')
 
-import sys as _sys
 from controlplane.api import register as _register_controlplane
-_register_controlplane(_sys.modules[__name__])
+_register_controlplane(sys.modules[__name__])

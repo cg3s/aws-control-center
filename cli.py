@@ -13,7 +13,7 @@ def parser_factory():
     p.add_argument('verb')
     p.add_argument('identifier', nargs='?')
     p.add_argument('--file')
-    p.add_argument('--profile', default='default')
+    p.add_argument('--profile', help='AWS account alias (uses the active account if omitted)')
     p.add_argument('--region', default='all')
     p.add_argument('--service', choices=['all','ec2','lightsail'], default='all')
     p.add_argument('--instance')
@@ -37,7 +37,8 @@ def execute(args, web):
         if not args.yes:
             raise ValueError('Use --yes to confirm this write operation')
     if args.area == 'instances' and args.verb == 'list':
-        return resources.inventory(web, '' if args.profile == 'all' else args.profile, args.region, args.service, limit=500)
+        profile = args.profile or web.active_profile()
+        return resources.inventory(web, '' if profile in (None, 'all') else profile, args.region, args.service, limit=500)
     if args.area == 'tasks':
         if args.verb in ('preview','submit'):
             if not args.file:
@@ -77,7 +78,8 @@ def execute(args, web):
     if args.area == 'traffic' and args.verb == 'report':
         if args.region == 'all' or args.service == 'all' or not args.instance:
             raise ValueError('Use explicit --region, --service and --instance')
-        return metrics.report(web,args.profile,args.region,args.service,args.instance,args.window,args.timezone,args.period)
+        profile = web.require_selected_profile(args.profile)
+        return metrics.report(web,profile,args.region,args.service,args.instance,args.window,args.timezone,args.period)
     if args.area == 'automation':
         if args.verb in ('pause','resume'):
             confirmed()

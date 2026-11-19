@@ -11,6 +11,11 @@ from .bootstrap import render
 from .store import document, documents, stamp
 
 
+def rule_profiles(payload):
+    selector = payload.get('selector')
+    return set(selector['profiles']) if selector is not None else {target['profile'] for target in payload['targets']}
+
+
 class Configurations:
     def __init__(self, web, jobs):
         self.web, self.jobs = web, jobs
@@ -84,20 +89,29 @@ class Configurations:
         identifier = str(uuid4())
         with self.web.db() as c:
             c.execute('BEGIN IMMEDIATE')
-            version = c.execute('SELECT COALESCE(MAX(version),0)+1 FROM v2_documents WHERE kind=? AND name=?', (data.kind, data.name)).fetchone()[0]
+            versions = c.execute('SELECT id,version,payload FROM v2_documents WHERE kind=? AND name=?', (data.kind, data.name)).fetchall()
             if data.kind == 'rule':
-                for old in c.execute("SELECT id,payload FROM v2_documents WHERE kind='rule' AND name=?", (data.name,)).fetchall():
+                profiles = rule_profiles(payload)
+                previous = []
+                for old in versions:
                     old_payload = json.loads(self.web.vault().decrypt(old['payload']))
+                    if rule_profiles(old_payload) != profiles:
+                        continue
+                    previous.append(old)
                     old_payload['enabled'] = False
                     c.execute('UPDATE v2_documents SET payload=? WHERE id=?',
                               (self.web.vault().encrypt(json.dumps(old_payload).encode()), old['id']))
                     c.execute('INSERT OR REPLACE INTO v2_rule_flags VALUES(?,0)', (old['id'],))
                     self.cancel_queue(c, old['id'])
+                versions = previous
+            version = max((old['version'] for old in versions), default=0) + 1
             c.execute('INSERT INTO v2_documents VALUES(?,?,?,?,?,?,?)', (identifier, data.kind, data.name, version,
                       self.web.vault().encrypt(json.dumps(payload).encode()), stamp(), stamp()))
             if data.kind == 'rule':
                 c.execute('INSERT INTO v2_rule_flags VALUES(?,?)', (identifier, int(payload['enabled'])))
-        self.web.audit(actor, data.kind, resource=identifier, operation='save-version', detail=data.name)
+        profiles = rule_profiles(payload) if data.kind == 'rule' else set()
+        self.web.audit(actor, data.kind, profile=next(iter(profiles)) if len(profiles) == 1 else '',
+                       resource=identifier, operation='save-version', detail=data.name)
         return self.public_document(document(self.web, identifier))
 
 

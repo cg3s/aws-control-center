@@ -20,19 +20,18 @@ export function TrafficView({target, epoch = 0}: {target: Target; epoch?: number
 }
 
 export function Resources({filters, epoch, refresh}: {filters: Filters; epoch: number; refresh: () => void}) {
-  const [search, setSearch] = useState(''), [group,setGroup] = useState(''), [selected, setSelected] = useState<React.Key[]>([]), [traffic, setTraffic] = useState<Target>();
-  const settings=useRemote<{items:{group_name:string}[]}>('/account-settings',epoch);
+  const [search, setSearch] = useState(''), [selected, setSelected] = useState<React.Key[]>([]), [traffic, setTraffic] = useState<Target>();
   const [scriptId, setScriptId] = useState(''), [connectionId, setConnectionId] = useState(''), [parameters,setParameters] = useState('');
-  const {data, error, loading} = useRemote<{items: Resource[]; errors: unknown[]; updated_at: object}>('/resources?' + qs({profiles: filters.profile === 'all' ? '' : filters.profile, region: filters.region, service: filters.service, search,group, limit: '500'}), epoch);
+  const {data, error, loading} = useRemote<{items: Resource[]; errors: unknown[]; updated_at: object}>('/resources?' + qs({profiles: filters.profile, region: filters.region, service: filters.service, search, limit: '500'}), epoch);
   const scripts = useRemote<{items: {id: string; name: string; version: number}[]}>('/configurations?kind=script', epoch);
-  const connections = useRemote<{items: {id: string; name: string; version: number}[]}>('/configurations?kind=connection', epoch);
+  const connections = useRemote<{items: {id: string; name: string; version: number}[]}>('/configurations?'+qs({kind: 'connection', profile: filters.profile}), epoch);
   const jobs = useTaskSubmission(() => {setSelected([]); refresh();});
-  useEffect(() => {setSelected([]); setTraffic(undefined);}, [filters.profile, filters.region, filters.service, search,group]);
+  useEffect(() => {setSelected([]); setTraffic(undefined);}, [filters.profile, filters.region, filters.service, search]);
   const target = (x: Resource): Target => ({profile: x.profile, region: x.region, service: x.service, instance: x.id, account_id: x.account_id, partition: x.partition});
   const chosen = () => (data?.items ?? []).filter(x => selected.includes(x.resource_key));
   const run = (kind: string, rows = chosen()) => void attempt(async()=>{await jobs.submit(rows.map(x => ({kind, target: target(x), script_id: scriptId, connection_id: connectionId,parameters:kind==='script'&&parameters?JSON.parse(parameters):{}})));});
-  return <><Card title="多账户实例管理" extra={<Button onClick={() => void attempt(async () => {await post('/resources/refresh'); message.success('已请求后台刷新');})}>刷新 AWS 清单</Button>}>
-    <Space wrap className="filters"><Select style={{minWidth:150}} value={group} onChange={setGroup} options={[{value:'',label:'全部账户分组'},...[...new Set(settings.data?.items.map(x=>x.group_name).filter(Boolean))].map(value=>({value,label:value}))]}/><Input.Search placeholder="搜索名称、IP、标签或账户" onSearch={setSearch} allowClear/>{['start', 'stop', 'reboot', 'delete'].map((kind, i) => <Button key={kind} danger={kind === 'delete'} disabled={!selected.length} loading={jobs.busy} onClick={() => run(kind)}>{['批量启动', '批量停止', '批量重启', '批量删除'][i]}</Button>)}</Space>
+  return <><Card title="实例管理" extra={<Button onClick={() => void attempt(async () => {await post('/resources/refresh'); message.success('已请求后台刷新');})}>刷新 AWS 清单</Button>}>
+    <Space wrap className="filters"><Input.Search placeholder="搜索名称、IP 或标签" onSearch={setSearch} allowClear/>{['start', 'stop', 'reboot', 'delete'].map((kind, i) => <Button key={kind} danger={kind === 'delete'} disabled={!selected.length} loading={jobs.busy} onClick={() => run(kind)}>{['批量启动', '批量停止', '批量重启', '批量删除'][i]}</Button>)}</Space>
     <ErrorBox error={error}/>{!!data?.errors.length && <Alert type="warning" message="部分账户或区域查询失败" description={JSON.stringify(data.errors)}/>}
     <Table loading={loading} rowKey="resource_key" dataSource={data?.items} pagination={{pageSize: 20}} scroll={{x: 1300}}
       rowSelection={{selectedRowKeys: selected, onChange: keys => {if (keys.length <= 100) setSelected(keys); else message.warning('每批最多 100 台');}}} columns={[
@@ -46,6 +45,6 @@ export function Resources({filters, epoch, refresh}: {filters: Filters; epoch: n
 
 export function TrafficCenter({filters,epoch}:{filters:Filters;epoch:number}) {
  const [window,setWindow]=useState('1h');
- const {data,error,loading}=useRemote<{inbound:number;outbound:number;complete:boolean;items:(Traffic&{target:Target})[]}>('/traffic/summary?'+qs({profiles:filters.profile==='all'?'':filters.profile,region:filters.region,service:filters.service,window}),epoch);
+ const {data,error,loading}=useRemote<{inbound:number;outbound:number;complete:boolean;items:(Traffic&{target:Target})[]}>('/traffic/summary?'+qs({profiles:filters.profile,region:filters.region,service:filters.service,window}),epoch);
  return <Card title="流量中心 / 实例排名"><Space><Select value={window} onChange={setWindow} options={[['1h','最近一小时'],['24h','最近一天'],['7d','最近七天'],['30d','最近三十天'],['day','今日 UTC'],['month','当月 UTC']].map(([value,label])=>({value,label}))}/><span>入站 {gib(data?.inbound??0)} · 出站 {gib(data?.outbound??0)}</span></Space><Alert className="section" type="info" message="汇总已配置监控的实例网络指标，同账户同实例去重；缺失区间不会当作零流量。"/><ErrorBox error={error}/><Table loading={loading} rowKey={x=>`${x.target.account_id}/${x.target.region}/${x.target.instance}/${x.target.generation}`} dataSource={data?.items} columns={[{title:'账户',render:(_,x)=>x.target.profile},{title:'区域',render:(_,x)=>x.target.region},{title:'实例',render:(_,x)=>x.target.instance},{title:'入站',dataIndex:'inbound',render:gib},{title:'出站',dataIndex:'outbound',render:gib},{title:'平均 Mbps',dataIndex:'rate_mbps',render:v=>v.toFixed(3)},{title:'完整性',render:(_,x)=>`${x.covered_buckets}/${x.expected_buckets}`}]} scroll={{x:900}}/></Card>;
 }

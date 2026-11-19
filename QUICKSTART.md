@@ -10,7 +10,7 @@
 sudo bash setup.sh docker
 ```
 
-镜像会自动安装前端构建依赖并构建新版界面，宿主机不需要 Node.js。首次执行生成 `.env` 和随机管理员密码，默认只监听 `127.0.0.1:8000`，使用本地 HTTP Cookie 配置。
+部署包自带 `static/app/` 预编译前端，Docker 直接打包这些文件，无需 Node.js 或 npm。首次执行生成 `.env` 和随机管理员密码，默认只监听 `127.0.0.1:8000`，使用本地 HTTP Cookie 配置。
 
 ## 原生 systemd / aaPanel
 

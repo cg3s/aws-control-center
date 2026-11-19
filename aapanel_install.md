@@ -44,18 +44,9 @@ AWS_REGIONS=us-east-1,us-west-2,ap-northeast-1,ap-northeast-2,ap-southeast-1,eu-
 
 `DATA_DIR=/app/data` 是容器内路径，保持这个值。Telegram 配置可以暂时留空。
 
-**3. 构建新版前端**
+**3. 检查预编译前端**
 
-如果需要当前 React 管理界面，先安装项目 README 要求的 Node.js 版本，例如 **22.12+**，然后执行：
-
-```bash
-cd /opt/aws-control-center/frontend
-npm install
-npm run build
-cd ..
-```
-
-构建结果输出到 `static/v8/`。现有 Dockerfile **不会自动构建前端**；跳过此步骤时，程序会回退到旧版界面。
+确认上传的项目包含完整的 `static/app/` 目录。Docker 直接打包这份前端产物，aaPanel 服务器无需安装 Node.js 或执行 npm。修改前端后，在开发机或 CI 构建并上传新的 `static/app/`。
 
 **4. 启动程序**
 

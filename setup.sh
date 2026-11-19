@@ -8,6 +8,10 @@ MODE="${1:-auto}"
 if [[ $MODE == auto ]]; then
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then MODE=docker; else MODE=native; fi
 fi
+if [[ ! -s static/app/index.html || ! -d static/app/assets ]]; then
+  echo '缺少预编译前端，请上传完整发布包，或在开发机完成构建后上传整个 static/app 目录。' >&2
+  exit 1
+fi
 if [[ "$MODE" == docker ]]; then
   command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1 || { echo 'Docker Compose 不可用。先安装 Docker Compose，或运行 sudo bash setup.sh native'; exit 1; }
   if [[ ! -f .env ]]; then
@@ -26,7 +30,6 @@ if [[ "$MODE" == docker ]]; then
   echo '启用公网 HTTPS 后，请将 .env 中 COOKIE_SECURE 改为 true 并运行 docker compose up -d'
 else
   [[ -d /run/systemd/system ]] || { echo '原生安装要求 systemd (Ubuntu/Debian)'; exit 1; }
-  [[ -f static/app/index.html ]] || { echo "请先构建 frontend 并携带 static/app，或使用 Docker 自动构建"; exit 1; }
   if ! command -v apt-get >/dev/null; then
     echo '当前仅支持 Ubuntu/Debian 的一键原生安装'; exit 1
   fi

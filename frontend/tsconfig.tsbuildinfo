@@ -1,1 +1,1 @@
-{"root":["./src/main.tsx"],"version":"5.8.3"}
+{"root":["./src/configurations.tsx","./src/operations.tsx","./src/resources.tsx","./src/tasks.tsx","./src/api.ts","./src/main.tsx","./src/shared.tsx"],"version":"5.8.3"}

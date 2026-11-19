@@ -3,10 +3,9 @@
 .env
 .aws
 data
-frontend/node_modules
+frontend
 __pycache__
 **/__pycache__
 **/*.pyc
-static
 .pytest_cache
 tests

@@ -27,7 +27,9 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-Docker 使用多阶段构建自动执行前端 `npm ci`、类型检查和生产构建。无需在宿主机安装 Node。Web 默认仅映射到 `127.0.0.1:8000`；通过已有 HTTPS 反代访问。纯本机 HTTP 测试需设置 `COOKIE_SECURE=false`。
+Docker 镜像直接打包仓库中的 `static/app/` 预编译前端。部署不需要 Node.js，也不执行 npm 安装或构建。发布和上传时请包含整个 `static/app/`。修改前端后，在开发机或 CI 执行下方的前端构建命令，将新产物随代码一起部署。
+
+Web 默认仅映射到 `127.0.0.1:8000`，可通过已有 HTTPS 反代访问。纯本机 HTTP 测试需设置 `COOKIE_SECURE=false`。
 
 首次启动后，在“ AWS 账户”添加凭据。共享 Profile 可另行只读挂载，Web Access Key 账户不依赖 `.aws` 目录。
 

@@ -71,6 +71,8 @@ sudo awscc upgrade /path/to/aws-control-center
 
 初始化模板的 AWS 入站规则支持 TCP/UDP、端口范围和 IPv4/IPv6 来源。规则为空时沿用服务原有设置。配置规则时，EC2 在启动前为该 VPC 创建或复用专用安全组，既有安全组的规则不受影响。Lightsail 先创建实例，再用模板替换默认公网入站规则并核对结果。需要登录 SSH 时，请在模板中包含 TCP 22 和允许连接的来源。
 
+在「实例管理」勾选正在运行、使用动态公网 IPv4 的实例，点击「批量更换公网 IP」。EC2 通过主网卡重新分配动态地址，需要只有一块网卡。Lightsail 按账户和区域逐台绑定、解绑并释放任务专用的临时静态 IP，需要空闲的静态 IP 配额。更换期间公网连接会中断。任务中心显示原地址和核验后的新地址。
+
 ## 监控与可靠性
 
 - 默认 5 分钟采样；已开启详细监控的 EC2 可选择 1 分钟。不会自动开启付费详细监控。监控 Worker 默认每 5 分钟评估一次（可设置 MONITOR_INTERVAL_SECONDS，最低 60 秒），预留 10 分钟指标延迟。
@@ -147,6 +149,7 @@ sudo awscc cost report --profile all
 - 实例角色需要针对指定角色的 `iam:PassRole`；主机 SSH 脚本不使用面板的 AWS 密钥。
 - Lightsail：实例、区域、套餐、镜像、密钥对和指标查询；按需授权创建、删除、启停、重启及静态 IP 操作。
 - 模板防火墙：EC2 需要 `ec2:CreateSecurityGroup` 和 `ec2:AuthorizeSecurityGroupIngress`，Lightsail 需要 `lightsail:GetInstancePortStates`、`lightsail:PutInstancePublicPorts` 和 `lightsail:GetOperation`。
+- 公网 IPv4 更换：EC2 需要 `ec2:DescribeNetworkInterfaces` 和 `ec2:ModifyNetworkInterfaceAttribute`。Lightsail 需要 `lightsail:GetStaticIp`、`lightsail:AllocateStaticIp`、`lightsail:AttachStaticIp`、`lightsail:DetachStaticIp`、`lightsail:ReleaseStaticIp` 和 `lightsail:GetOperation`。
 - 流量：EC2 需要 `cloudwatch:GetMetricStatistics`；Lightsail 需要 `lightsail:GetInstanceMetricData`。
 - 成本：`ce:GetCostAndUsage` 与账户账单访问能力。
 

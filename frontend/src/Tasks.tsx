@@ -1,7 +1,7 @@
 import {useState} from 'react';
 import {Alert, Button, Card, Checkbox, Descriptions, Form, Input, InputNumber, Select, Space, Table, Tag} from 'antd';
 import {api, post, qs, Filters, Target, Task, Configuration} from './api';
-import {attempt, ErrorBox, useRemote, useTaskSubmission} from './shared';
+import {attempt, ErrorBox, taskKindLabel, useRemote, useTaskSubmission} from './shared';
 import {FirewallFields} from './FirewallFields';
 
 type Catalog = {bundles?: {id: string; name: string; price_usd_per_month: number}[]; blueprints?: {id: string; name: string}[]; zones?: string[];
@@ -76,8 +76,9 @@ export function Tasks({profile, epoch, refresh}: {profile: string; epoch: number
     {title: '任务', dataIndex: 'id'}, {title: '状态', dataIndex: 'status', render: v => <Tag>{v}</Tag>}, {title: '来源', dataIndex: 'actor'}, {title: '创建时间', dataIndex: 'created_at'},
     {title: '操作', render: (_, x) => <Space><Button onClick={() => void attempt(async () => {await post('/tasks/'+x.id+'/verify?'+qs({profile})); refresh();})}>核验</Button><Button danger onClick={() => void attempt(async () => {await post('/tasks/'+x.id+'/cancel?'+qs({profile})); refresh();})}>取消未提交项</Button></Space>},
   ]} expandable={{expandedRowRender: x => <Table rowKey="id" size="small" pagination={false} dataSource={x.items} columns={[
-    {title: '操作', dataIndex: 'kind'}, {title: '目标', render: (_, i) => `${i.target.profile}/${i.target.region}/${i.target.instance}`}, {title: '状态', dataIndex: 'status'}, {title: '错误', dataIndex: 'error'},
-    {title: '结果', render: (_, i) => <Descriptions column={1} items={Object.entries(i.result).map(([k, v]) => ({key: k, label: k, children: String(v)}))}/>},
+    {title: '操作', dataIndex: 'kind', render: taskKindLabel}, {title: '目标', render: (_, i) => `${i.target.profile}/${i.target.region}/${i.target.instance}`}, {title: '状态', dataIndex: 'status'}, {title: '错误', dataIndex: 'error'},
+    {title: '结果', render: (_, i) => <Descriptions column={1} items={Object.entries(i.result).map(([k, v]) => ({key: k,
+      label: k === 'old_ip' ? '原公网 IPv4' : k === 'new_ip' ? '新公网 IPv4' : k, children: String(v)}))}/>},
     {title: '输出', render: (_, i) => i.result.output_available ? <Button onClick={() => void attempt(async () => setOutput(JSON.stringify(await api('/task-items/'+i.id+'/output?'+qs({profile})), null, 2)))}>查看输出</Button> : null},
   ]}/>}}/></Card>{output && <Card title="脚本输出（最多各 32 KiB，可能包含脚本输出的秘密）" className="section" extra={<Button onClick={() => setOutput('')}>关闭</Button>}><pre className="detail">{output}</pre></Card>}</>;
 }

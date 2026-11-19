@@ -8,7 +8,7 @@ from uuid import uuid4
 from datetime import datetime, timezone
 from fastapi import HTTPException
 from botocore.exceptions import ClientError
-from . import firewall, resources, ssh
+from . import firewall, ip_rotation, resources, ssh
 from .bootstrap import render
 from .models import Launch
 from .store import stamp, document, documents, heartbeat
@@ -56,11 +56,13 @@ class Jobs:
         if any(not k or len(k)>128 or len(v)>256 or k.lower().startswith('aws:') or k in ('awscc-task','awscc-created-at') for k,v in options['tags'].items()):
             raise HTTPException(400, 'Invalid or reserved resource tag')
         if item.kind != 'create':
-            current = resources.observe(w, target)
+            current = resources.observe(w, target, network=True) if item.kind == 'rotate_ip' else resources.observe(w, target)
             if target['generation'] and target['generation'] != current['generation']:
                 raise HTTPException(409, 'Instance was replaced; select the current resource')
             target['generation'] = current['generation']
             payload['before'] = current
+            if item.kind == 'rotate_ip':
+                ip_rotation.validate(target, current)
             if item.kind in ('script', 'bootstrap_verify'):
                 connection_id = item.connection_id
                 if not connection_id:
@@ -299,9 +301,10 @@ class Jobs:
         if self.detail(identifier, profile)['status'] == 'archived':
             raise HTTPException(409, 'Inspect historical instances from the resource list')
         with self.web.db() as c:
-            c.execute("""UPDATE v2_items SET status='verifying',lease_until=NULL WHERE job_id=?
+            c.execute("""UPDATE v2_items SET status='verifying',lease_until=NULL,
+                attempted_at=CASE WHEN kind='rotate_ip' AND status='unknown' THEN ? ELSE attempted_at END WHERE job_id=?
                 AND status IN ('submitted','unknown') AND kind NOT IN ('script','bootstrap_verify')
-                AND (? IS NULL OR json_extract(target,'$.profile')=?)""", (identifier, profile, profile))
+                AND (? IS NULL OR json_extract(target,'$.profile')=?)""", (stamp(), identifier, profile, profile))
         self.web.audit(actor, 'task', profile=profile or '', resource=identifier, operation='verify')
         return self.detail(identifier, profile)
 
@@ -310,20 +313,24 @@ class Jobs:
         heartbeat(w, 'tasks')
         with w.db() as c:
             c.execute('BEGIN IMMEDIATE')
-            c.execute("UPDATE v2_items SET status='unknown',error='Worker lease expired; verify before retry',lease_until=NULL WHERE status='running' AND lease_until<?", (time.time(),))
+            now = time.time()
+            c.execute("UPDATE v2_items SET status='unknown',error='Worker lease expired; verify before retry',lease_until=NULL WHERE status='running' AND lease_until<?", (now,))
             row = c.execute("""SELECT i.* FROM v2_items i JOIN v2_jobs j ON j.id=i.job_id
                 WHERE i.status IN ('queued','submitted','verifying') AND (i.lease_until IS NULL OR i.lease_until<?)
-                AND NOT EXISTS (SELECT 1 FROM v2_items previous WHERE previous.job_id=i.job_id
-                  AND previous.rowid<i.rowid AND previous.status NOT IN ('succeeded','failed','unknown','canceled','archived')
+                AND NOT EXISTS (SELECT 1 FROM v2_items previous
+                  WHERE (previous.job_id=i.job_id OR i.kind='rotate_ip' OR previous.kind='rotate_ip')
+                  AND (previous.rowid<i.rowid OR (previous.id<>i.id AND previous.lease_owner IS NOT NULL AND previous.lease_until>?))
+                  AND previous.status NOT IN ('succeeded','failed','unknown','canceled','archived')
                   AND json_extract(previous.target,'$.account_id')=json_extract(i.target,'$.account_id')
                   AND json_extract(previous.target,'$.partition')=json_extract(i.target,'$.partition')
                   AND json_extract(previous.target,'$.region')=json_extract(i.target,'$.region')
                   AND json_extract(previous.target,'$.service')=json_extract(i.target,'$.service')
-                  AND json_extract(previous.target,'$.instance')=json_extract(i.target,'$.instance'))
+                  AND (json_extract(previous.target,'$.instance')=json_extract(i.target,'$.instance')
+                       OR (previous.kind='rotate_ip' AND i.kind='rotate_ip' AND json_extract(i.target,'$.service')='lightsail')))
                 AND NOT (j.actor='automation' AND EXISTS (SELECT 1 FROM app_settings WHERE name='automation_paused' AND value='true'))
                 AND NOT (j.actor='automation' AND EXISTS (SELECT 1 FROM v2_events e LEFT JOIN v2_rule_flags f ON f.rule_id=e.rule_id
                     WHERE j.request_key='event-'||e.id AND COALESCE(f.enabled,0)=0))
-                ORDER BY j.updated_at,i.updated_at,i.rowid LIMIT 1""", (time.time(),)).fetchone()
+                ORDER BY j.updated_at,i.updated_at,i.rowid LIMIT 1""", (now, now)).fetchone()
             if not row:
                 for job in c.execute("SELECT id FROM v2_jobs WHERE status IN ('queued','running')").fetchall():
                     self.summarize(c, job['id'])
@@ -339,7 +346,21 @@ class Jobs:
             resources.assert_identity(w, target)
             if payload.get('prepare_error'):
                 raise HTTPException(400, payload['prepare_error'])
-            if checking:
+            if kind == 'rotate_ip':
+                if checking:
+                    api = w.mutation_client(target['profile'], target['service'], target['region'])
+                    def send(method, **kwargs):
+                        return mutate(api, method, target, **kwargs)
+                    status = ip_rotation.advance(w, row, payload, result, send)
+                    if status == 'failed':
+                        error = result.pop('rotation_error', '')
+                else:
+                    current = resources.observe(w, target, network=True)
+                    if current['generation'] != target['generation']:
+                        raise HTTPException(409, 'Instance generation changed')
+                    ip_rotation.start(row, payload, current, result)
+                    status = 'verifying'
+            elif checking:
                 status, result = self.check(row, payload, result)
             else:
                 api = w.mutation_client(target['profile'], target['service'], target['region'])
@@ -390,7 +411,7 @@ class Jobs:
         with w.db() as c:
             c.execute('UPDATE v2_items SET status=?,result=?,error=?,payload=?,updated_at=?,lease_until=?,lease_owner=NULL WHERE id=? AND lease_owner=?',
                       (status, encode(result), error[:350], w.vault().encrypt(encode(payload).encode()), stamp(),
-                       time.time()+15 if status in ('submitted', 'verifying') else None, row['id'], owner))
+                       time.time()+(5 if kind == 'rotate_ip' else 15) if status in ('submitted', 'verifying') else None, row['id'], owner))
             self.summarize(c, row['job_id'])
         w.audit('task-worker', 'task', profile=target['profile'], region=target['region'], service=target['service'],
                 resource=target['instance'], operation=kind, result=status, detail=error)

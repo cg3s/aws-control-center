@@ -68,7 +68,7 @@ class CreateOptions(Strict):
 
 
 class JobItem(Strict):
-    kind: Literal['create', 'delete', 'start', 'stop', 'reboot', 'script', 'bootstrap_verify']
+    kind: Literal['create', 'delete', 'start', 'stop', 'reboot', 'rotate_ip', 'script', 'bootstrap_verify']
     target: Target
     options: CreateOptions = Field(default_factory=CreateOptions)
     script_id: str = ''

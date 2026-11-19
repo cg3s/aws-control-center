@@ -34,7 +34,7 @@ export function Resources({filters, epoch, refresh}: {filters: Filters; epoch: n
     setTrafficResource(resource);
     setTrafficOpen(true);
   };
-  const target = (x: Resource): Target => ({profile: x.profile, region: x.region, service: x.service, instance: x.id, account_id: x.account_id, partition: x.partition});
+  const target = (x: Resource): Target => ({profile: x.profile, region: x.region, service: x.service, instance: x.id, account_id: x.account_id, partition: x.partition, generation: x.generation});
   const chosen = () => (data?.items ?? []).filter(x => selected.includes(x.resource_key));
   const run = (kind: string, rows = chosen()) => void attempt(async()=>{await jobs.submit(rows.map(x => ({kind, target: target(x), script_id: scriptId, connection_id: connectionId,parameters:kind==='script'&&parameters?JSON.parse(parameters):{}})));});
   const refreshInventory = () => void attempt(async () => {
@@ -47,7 +47,9 @@ export function Resources({filters, epoch, refresh}: {filters: Filters; epoch: n
     }
   });
   return <><Card title="实例管理" extra={<Button loading={refreshing} onClick={refreshInventory}>刷新 AWS 清单</Button>}>
-    <Space wrap className="filters"><Input.Search placeholder="搜索名称、IP 或标签" onSearch={setSearch} allowClear/>{['start', 'stop', 'reboot', 'delete'].map((kind, i) => <Button key={kind} danger={kind === 'delete'} disabled={!selected.length} loading={jobs.busy} onClick={() => run(kind)}>{['批量启动', '批量停止', '批量重启', '批量删除'][i]}</Button>)}</Space>
+    <Space wrap className="filters"><Input.Search placeholder="搜索名称、IP 或标签" onSearch={setSearch} allowClear/>{['start', 'stop', 'reboot', 'delete'].map((kind, i) => <Button key={kind} danger={kind === 'delete'} disabled={!selected.length} loading={jobs.busy} onClick={() => run(kind)}>{['批量启动', '批量停止', '批量重启', '批量删除'][i]}</Button>)}
+      <Button disabled={!selected.length} loading={jobs.busy} onClick={() => run('rotate_ip')}>批量更换公网 IP</Button>
+    </Space>
     <ErrorBox error={error}/>{!!data?.errors.length && <Alert type="warning" message="部分账户或区域查询失败" description={JSON.stringify(data.errors)}/>}
     <Table loading={loading} rowKey="resource_key" dataSource={data?.items} pagination={{pageSize: 20}} scroll={{x: 1300}}
       rowSelection={{selectedRowKeys: selected, onChange: keys => {if (keys.length <= 100) setSelected(keys); else message.warning('每批最多 100 台');}}} columns={[

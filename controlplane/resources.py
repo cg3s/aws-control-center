@@ -19,7 +19,7 @@ def identity(web, profile):
     return data['Account'], data['Arn'].split(':')[1]
 
 
-def observe(web, target):
+def observe(web, target, *, network=False):
     api = web.client(target['profile'], target['service'], target['region'])
     if target['service'] == 'lightsail':
         x = api.get_instance(instanceName=target['instance'])['instance']
@@ -28,13 +28,24 @@ def observe(web, target):
         return {'id': x['name'], 'state': x.get('state', {}).get('name', 'unknown'), 'created_at': created,
                 'public': x.get('publicIpAddress', ''), 'private': x.get('privateIpAddress', ''),
                 'generation': x.get('arn', '') + '/' + str(x.get('createdAt', '')),
-                'bundle_id': x.get('bundleId', '')}
+                'bundle_id': x.get('bundleId', '')} | ({'is_static': x.get('isStaticIp')} if network else {})
     x = api.describe_instances(InstanceIds=[target['instance']])['Reservations'][0]['Instances'][0]
-    return {'id': x['InstanceId'], 'state': x['State']['Name'],
+    result = {'id': x['InstanceId'], 'state': x['State']['Name'],
             'public': x.get('PublicIpAddress', ''), 'private': x.get('PrivateIpAddress', ''),
             'generation': x['InstanceId'], 'disk_policy': x.get('BlockDeviceMappings', []),
             'image_id': x.get('ImageId', ''), 'detailed_monitoring': x.get('Monitoring', {}).get('State') == 'enabled',
             'created_at': next((t['Value'] for t in x.get('Tags', []) if t['Key'] == 'awscc-created-at'), '')}
+    if network:
+        interfaces = x.get('NetworkInterfaces', [])
+        if len(interfaces) == 1 and interfaces[0].get('Attachment', {}).get('DeviceIndex') == 0:
+            interface_id = interfaces[0]['NetworkInterfaceId']
+            interface = api.describe_network_interfaces(NetworkInterfaceIds=[interface_id])['NetworkInterfaces'][0]
+            attachment = interface.get('Attachment', {})
+            if attachment.get('InstanceId') == x['InstanceId'] and attachment.get('DeviceIndex') == 0:
+                association = interface.get('Association', {})
+                result.update(interface_id=interface_id, public=association.get('PublicIp', ''),
+                              is_static=any(association.get(key) for key in ('AllocationId', 'CarrierIp', 'CustomerOwnedIp')))
+    return result
 
 
 def assert_identity(web, target):
@@ -101,6 +112,16 @@ def inventory(web, profiles='', region='all', service='all', search='', offset=0
             generation = target.get('generation') if target['service'] == 'lightsail' else None
             if target['service'] != 'lightsail' or generation:
                 deleted.add((key, generation))
+        rotated = {}
+        oldest = min((row['fetched_at'] for row in rows if row['profile'] in chosen), default=None)
+        if oldest is not None:
+            for record in c.execute("""SELECT target, result FROM v2_items
+                WHERE kind='rotate_ip' AND status='succeeded' AND updated_at>=?""", (oldest[:19] + '+00:00',)):
+                target, rotation = json.loads(record['target']), json.loads(record['result'])
+                key = '/'.join(target[field] for field in ('partition', 'account_id', 'region', 'service', 'instance'))
+                generation = target['generation'] if target['service'] == 'lightsail' else None
+                if rotation['verified_at'] > rotated.get((key, generation), {}).get('verified_at', ''):
+                    rotated[key, generation] = rotation
     result, errors, seen, updates = [], [], set(), {}
     for row in rows:
         if row['profile'] not in chosen:
@@ -115,6 +136,9 @@ def inventory(web, profiles='', region='all', service='all', search='', offset=0
             if key in seen or (region != 'all' and x['region'] != region) or (service != 'all' and x['service'] != service):
                 continue
             seen.add(key)
+            rotation = rotated.get((key, generation))
+            if rotation and rotation['verified_at'] > row['fetched_at']:
+                x['ip'] = rotation['new_ip']
             if search.lower() not in json.dumps(x, ensure_ascii=False).lower():
                 continue
             result.append(x)

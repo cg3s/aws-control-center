@@ -1,43 +1,54 @@
-# AWS Control Center V9.1 极简部署
+# 快速部署 AWS Control Center
 
-**不需要 `.aws` 文件夹，不需要提前安装 Node.js，也不需要手动配置 AWS Access Key。** 默认使用项目自带的旧版 Web 页面；React 新界面属于可选构建。
+当前只提供新版 React 控制台和一套 `/api`，旧版页面与接口已移除。完整功能、升级和迁移说明见 [README](README.md)。
 
-## 一、三步启动（Ubuntu / Debian）
+## Docker
 
-1. 解压下载的 ZIP，进入 `aws-control-center` 目录。
-2. 执行 `sudo bash setup.sh`。如果服务器已有 Docker Compose，会使用 Docker；否则自动采用 Linux 原生 systemd 安装（自动安装 Python 依赖）。也可指定 `sudo bash setup.sh docker` 或 `sudo bash setup.sh native`。
-3. 用 `ssh -L 8000:127.0.0.1:8000 用户名@服务器IP` 建立安全隧道，然后在电脑浏览器访问 `http://127.0.0.1:8000`。
+在 Ubuntu/Debian 等已安装 Docker Engine 和 Compose 的服务器运行：
 
-## 二、查找登录密码
+```bash
+sudo bash setup.sh docker
+```
 
-Docker：`sudo grep '^APP_PASSWORD=' .env`
+镜像会自动安装前端构建依赖并构建新版界面，宿主机不需要 Node.js。首次执行生成 `.env` 和随机管理员密码，默认只监听 `127.0.0.1:8000`，使用本地 HTTP Cookie 配置。
 
-原生：`sudo grep '^APP_PASSWORD=' /etc/aws-control-center/awscc.env`
+## 原生 systemd / aaPanel
 
-登录后到 **账户管理** 添加账户别名、Access Key ID、Secret Access Key，STS 验证后保存并点击 **激活**，再访问 Lightsail / EC2 等资源。不要使用 root 账号长期密钥；使用最小权限 IAM 密钥。
+发布包已有 `static/app/index.html` 时可运行：
 
-## 三、日常管理
+```bash
+sudo bash setup.sh native
+```
 
-Docker：`sudo docker compose ps`、`sudo docker compose logs -f`、`sudo docker compose restart`
+仅有源码时，先在构建机器执行以下命令，并将生成的 `static/app` 随源码一起部署：
 
-原生：`sudo awscc status`、`sudo awscc logs`、`sudo awscc restart`
+```bash
+cd frontend
+npm ci
+npm run typecheck
+npm run build
+```
 
-## 四、配置域名（可选）
+原生安装要求 Ubuntu/Debian、systemd，以及 apt/Python 包下载网络。与 Docker 二选一，不要同时运行两组 Worker。
 
-将 Nginx/aaPanel 的 HTTPS 站点反向代理到 `http://127.0.0.1:8000`。确保已签发有效 TLS 证书，再将 `COOKIE_SECURE=true` 写入对应配置，并重启服务。不要直接将后端 8000 端口暴露到公网。
+## 登录与账户
 
-## 五、备份
+远程访问先建立隧道：
 
-Docker：备份项目 `.env`、`data/control.db`、`data/credential.key` 及整个 `data` 目录。备份前暂停写入或使用 SQLite 在线备份 API，避免直接复制活动数据库导致数据不一致。
+```bash
+ssh -L 8000:127.0.0.1:8000 USER@SERVER_IP
+```
 
-原生：备份 `/etc/aws-control-center/awscc.env`、`/var/lib/aws-control-center/control.db`、`/var/lib/aws-control-center/credential.key`；可运行 `sudo awscc backup` 备份数据库，**另外备份 credential.key**。
+浏览器打开 `http://127.0.0.1:8000`。Docker 密码在项目 `.env`，原生密码在 `/etc/aws-control-center/awscc.env`。登录后在“AWS 账户”添加 Access Key 或角色账户，等待后台清单更新；不需要提前准备 `.aws` 文件夹。
 
-**数据库和 credential.key 必须配对保存。** 丢失加密密钥会导致保存的 AWS Secret Access Key 无法解密。
+使用 HTTPS 反代时将 `COOKIE_SECURE=true` 写入对应配置并重启。实例创建、删除与自动化执行均在界面中单独确认和配置。
 
-## 六、注意
+## 管理、备份、升级
 
-- Docker 模式需要预先安装 Docker Engine 和 Compose 插件；一键脚本不会自动安装 Docker。
-- 原生安装只适配 Ubuntu / Debian + systemd，且需要 apt 网络与 Python 包安装网络。
-- 默认只绑定 `127.0.0.1:8000`。远程先用 SSH 转发；公网使用需另配 HTTPS、网络访问限制与额外登录防护。
-- 原生安装脚本为了兼容 V9.1，会保留传统 `.aws` 路径环境变量，但 Web 保存密钥并不依赖 `.aws` 目录存在。
-- 本简化包已做静态检查；未在真实 Linux 机器、Docker 环境或真实 AWS 账户上完成端到端部署验证。
+Docker 日志：`sudo docker compose logs -f`。
+
+原生日常命令：`sudo awscc status`、`sudo awscc logs`、`sudo awscc restart`。
+
+原生备份：`sudo awscc backup`，包含 `control.db`、`metrics.db`、加密密钥及配置。Docker 先停止三个服务，备份 `.env` 和整个 `data/` 后再启动。
+
+原生升级：完成新前端构建后运行 `sudo awscc upgrade /path/to/source`。数据库与加密密钥必须配对保留；旧任务会归档，旧监控会导入为新规则，无法验证的规则默认禁用待复核。

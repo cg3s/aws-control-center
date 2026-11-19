@@ -1,0 +1,12 @@
+.git
+.venv
+.env
+.aws
+data
+frontend/node_modules
+__pycache__
+**/__pycache__
+**/*.pyc
+static
+.pytest_cache
+tests

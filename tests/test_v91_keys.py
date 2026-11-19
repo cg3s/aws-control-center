@@ -85,5 +85,5 @@ def test_refuse_removal_with_monitor(env,monkeypatch):
     stub_sts(app,monkeypatch)
     client.post('/api/key-accounts',json={'alias':'prod1','access_key_id':'AKIA'+'A'*16,'secret_access_key':'b'*40},headers=headers)
     with app.db() as db:
-        db.execute("INSERT INTO monitors(profile,region,instance,threshold_gib,enabled,created_at) VALUES('prod1','us-east-1','test',1,1,'now')")
+        db.execute("INSERT INTO v2_documents VALUES('test-rule','rule','test',1,?,'now','now')", (app.vault().encrypt(b'{\"targets\":[{\"profile\":\"prod1\"}]}'),))
     assert client.delete('/api/key-accounts/prod1',headers=headers).status_code==409

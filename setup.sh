@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AWS Control Center V9.1 streamlined deployment. Run: sudo bash setup.sh [docker|native]
+# AWS Control Center deployment. Run: sudo bash setup.sh [docker|native]
 set -Eeuo pipefail
 [[ $EUID -eq 0 ]] || { echo '请使用 sudo bash setup.sh'; exit 1; }
 cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
@@ -26,6 +26,7 @@ if [[ "$MODE" == docker ]]; then
   echo '启用公网 HTTPS 后，请将 .env 中 COOKIE_SECURE 改为 true 并运行 docker compose up -d'
 else
   [[ -d /run/systemd/system ]] || { echo '原生安装要求 systemd (Ubuntu/Debian)'; exit 1; }
+  [[ -f static/app/index.html ]] || { echo "请先构建 frontend 并携带 static/app，或使用 Docker 自动构建"; exit 1; }
   if ! command -v apt-get >/dev/null; then
     echo '当前仅支持 Ubuntu/Debian 的一键原生安装'; exit 1
   fi

@@ -1,295 +1,184 @@
-**V9.1 更新：** Web 添加多个 AWS Access Key 并激活，无需强制 `.aws`。详见 [V9_1_ACCESS_KEYS.md](V9_1_ACCESS_KEYS.md)。
+# AWS Control Center
 
-实例流量、中文区域、创建确认与 Linux 启动脚本 / SSH Key / root 配置更新及 aaPanel 升级步骤见 [UI_UPDATE.md](UI_UPDATE.md)。
+单管理员、自托管的 AWS 多账户控制台。只提供一套 React 管理界面与 `/api` 接口；旧 HTML、`/legacy`、旧实例操作接口和旧专用创建队列已移除。
 
-> **V7.0:** See [V7_UPGRADE.md](V7_UPGRADE.md) for AWS regional catalog, read-only task verification and new CLI commands.
+## 功能
 
-> **V6.0 upgrade:** See [V6_UPGRADE.md](V6_UPGRADE.md) for the persistent Lightsail create queue, Web UI, CLI, Docker and systemd instructions.
+- **账户**：本地 AWS Profile、加密 Access Key、AssumeRole；支持使用保存的 Access Key 作为角色来源、账户分组与禁用。
+- **资源**：跨账户/区域 EC2 与 Lightsail 清单，按真实账户身份去重，后台缓存、搜索、局部失败反馈。
+- **批量任务**：创建、删除、启动、停止、重启，单批最多 100 项；预览固定目标后确认提交，逐项状态及审计。
+- **EC2 创建**：按需 Linux、AMI、架构检查、现有子网/安全组、根盘、公网 IP、密钥对、实例角色，以及固定版本的 Launch Template。
+- **Lightsail 创建**：区域套餐、Linux 镜像、可用区、密钥对、价格预览。
+- **DIY 初始化**：默认用户/普通用户/root 公钥，root 密码哈希，独立 SSH 登录策略，首次启动 Bash 脚本，版本化模板及单次覆盖。
+- **SSH 脚本**：加密连接凭据、强制 SHA256 主机指纹、按实例绑定的独立连接、环境变量参数、可选免密 sudo、超时、退出码与加密保存的截断输出。
+- **流量**：入站/出站、平均 Mbps、1 小时/1 日/7 日/30 日及自然日/月查询；固定桶去重、迟到数据修正、完整性标识和监控实例排名。
+- **自动化**：通知、SSH 脚本、停机；连续超限、恢复阈值、冷却、每日上限、维护期、标签动态匹配、集合汇总阈值、历史模拟、规则暂停和全局紧急暂停。
+- **其他**：Lightsail 静态 IP、套餐元数据、TCP 检测与历史、跨账户费用汇总、任务历史与审计。
 
-# AWS Control Center V4
+网络流量是 AWS 指标，**不是账单流量或套餐剩余额度**。停机后磁盘、IP、Lightsail 套餐等费用可能继续产生。删除实例默认不释放独立 IP、磁盘和快照，EC2 按资源原有磁盘删除策略执行，尊重终止保护。
 
-Self-hosted single-administrator AWS dashboard, built with FastAPI, boto3, vanilla JavaScript and persistent SQLite. This is an independently built management panel, not a copy of SLauncher software.
+## 启动
 
-## Features
-
-- Multiple AWS shared profiles and cross-account STS AssumeRole aliases; V9.1 additionally saves encrypted Secret Access Keys in SQLite (Fernet key stored separately)
-- Concurrent EC2 and Lightsail inventory by region with isolated per-service errors and pagination
-- Start, stop, reboot and confirmation-based batch actions (up to 20 resources; sequential)
-- Lightsail NetworkIn and NetworkOut CloudWatch sample sums (1/7/30 days), with daily chart
-- Current-month Cost Explorer UnblendedCost by service
-- Persistent session store, CSRF protection and basic per-IP login lockouts, SQLite operation audit
-- Role account create/list/delete, without deleting IAM roles
-
-## Deploy
+### Docker
 
 ```bash
 cp .env.example .env
-# Set a unique random APP_PASSWORD of 16+ characters, change regions as needed
-# No ~/.aws directory is required for Web Access Key accounts. Legacy profiles are optional.
-mkdir -p data
-chmod 700 data
-# When using HTTPS through Nginx, keep COOKIE_SECURE=true
+# 编辑 APP_PASSWORD，至少 16 位；按需配置 AWS_REGIONS、Telegram、COOKIE_SECURE。
 docker compose up -d --build
 ```
 
-App binds `127.0.0.1:8000` on the host. Reverse proxy behind HTTPS and restrict access with VPN/zero-trust access controls. Use `COOKIE_SECURE=false` ONLY for local HTTP testing. Never expose unauthenticated AWS management endpoints to the Internet. V9.1 no longer mounts `~/.aws` by default; optional legacy Profile mounts must be configured separately and protected. `AWS_EC2_METADATA_DISABLED=true` is set in Compose as a defensive default, so EC2 instance profile credentials do not work there unless explicitly reconfigured. Credential processes / SSO profiles may need additional files or host credential forwarding.
+Docker 使用多阶段构建自动执行前端 `npm ci`、类型检查和生产构建。无需在宿主机安装 Node。Web 默认仅映射到 `127.0.0.1:8000`；通过已有 HTTPS 反代访问。纯本机 HTTP 测试需设置 `COOKIE_SECURE=false`。
 
-## Accounts
+首次启动后，在“ AWS 账户”添加凭据。共享 Profile 可另行只读挂载，Web Access Key 账户不依赖 `.aws` 目录。
 
-A role alias records `alias`, `source_profile`, `role_arn`, optional `external_id` in SQLite. When querying, the server calls STS AssumeRole using source credentials. Target role must trust the source principal. Role credentials are not persisted, but short-lived credentials exist in application process memory. Only the profile names visible in the panel can be used for mutation.
-
-## Example least-privilege IAM actions
-
-Read: `sts:GetCallerIdentity`, `sts:AssumeRole` (when needed), `ec2:DescribeInstances`, `lightsail:GetInstances`, `lightsail:GetInstanceMetricData`, `ce:GetCostAndUsage`.
-
-Mutations (optional): `ec2:StartInstances`, `ec2:StopInstances`, `ec2:RebootInstances`, `lightsail:StartInstance`, `lightsail:StopInstance`, `lightsail:RebootInstance`.
-
-Use IAM resource restrictions for state changes, where supported, and separate read-only roles. `ce:GetCostAndUsage` generally needs billing permissions and data access enabled by the account.
-
-## API overview
-
-- `POST /api/login` returns a CSRF secret to the JS client, sets `HttpOnly; SameSite=Strict` session cookie
-- `GET /api/session`, `POST /api/logout`, `GET /api/config`, `GET /api/accounts`, `POST /api/accounts`, `DELETE /api/accounts/{alias}`
-- `GET /api/identity`, `GET /api/instances`, `POST /api/instance/action`, `POST /api/instance/batch`
-- `GET /api/traffic?profile=default&region=ap-northeast-1&instance=myserver&days=7`
-- `GET /api/cost`, `GET /api/audit?limit=100`
-
-State-changing calls after login require `X-AWSCC-CSRF` header, set to the secret returned from `/api/session`.
-
-## Limitations & guardrails
-
-- NetworkIn/NetworkOut are metric samples, **not** Lightsail plan traffic quota, billable transfer, or remaining plan allowance. CloudWatch metrics can be delayed or incomplete.
-- Batch actions are bounded but not atomic: some items may succeed even when others fail. Read the per-item response and audit log.
-- Cost Explorer can lag and final invoices may differ. Each AWS account is billed independently.
-- Single-admin UI, no MFA/SSO/RBAC. For Internet-facing production deployments add an identity-aware access layer, MFA, alerting, immutable audit exports, backups, IAM scoping, observability, structured tests, and rate limits for all API endpoints.
-- Login brute-force lockout is based on socket peer IP (not untrusted proxy headers), so behind Nginx it may lock all clients together if five failed attempts occur from that proxy IP. Restrict upstream at Nginx or use auth gateway / WAF in front.
-- External IDs are stored as readable SQLite values. Lock down `./data` and maintain secure backups.
-- SQLite persists sessions across restarts. Deploy only one application process; for multi-replica setups replace it with a central session/rate limiting store.
-
-## V3: independent scheduled monitoring and Telegram alerts
-
-V3 adds a dedicated `aws-monitor-worker` container (one replica only), V3 UI "流量告警", and new monitoring APIs. Existing `control.db` is upgraded additively using SQLite `CREATE TABLE IF NOT EXISTS` on startup. **Back up `./data` before updating.**
-
-Set the following in `.env`:
-
-```env
-MONITOR_INTERVAL_SECONDS=900
-ALERT_COOLDOWN_SECONDS=3600
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
-```
-
-Leave the Telegram fields empty for database-only alerts. To enable notifications, supply an existing Telegram bot token and your designated chat ID. Keep `.env` private. Start both services via `docker compose up -d --build`. Inspect worker status with `docker compose logs -f aws-monitor-worker`. Do not scale the worker above 1 replica; there is no distributed lease in V3.
-
-Create a watch from the monitoring tab or use the authenticated `POST /api/monitors` endpoint with `{ "profile":"default", "region":"ap-northeast-1", "instance":"example", "threshold_gib":1.0, "enabled":true }`. The threshold compares the **sum of Lightsail NetworkIn and NetworkOut samples over a sliding hour** (delayed 5 minutes for metric availability). This is neither monthly billable data transfer nor the included transfer quota. 15-minute samples overlap by design; do not sum them to compute a monthly transfer total.
-
-New endpoints: `GET/POST /api/monitors`, `DELETE /api/monitors/{id}`, `GET /api/monitor/samples?monitor_id=...`, `GET /api/alerts`, and `POST /api/ip/check`. The last endpoint resolves the target instance public IPv4 using the AWS Lightsail API, rejects private/non-global IPs and limits tests to TCP 22, 80 or 443 from the panel server. It does not change IP allocation, test ICMP, or evaluate geographic connectivity. All mutation/probe requests require login and CSRF.
-
-Additional IAM read permission: `lightsail:GetInstance`. Monitoring has an AWS API cost/usage impact depending on the service and metrics; keep the watch list deliberately small and verify current AWS pricing. Network metric errors appear in the sample table, but do not themselves trigger Telegram alerts. Alerts are recorded once per threshold crossing check with a cooldown (default 1h) and no automatic instance actions. Failed Telegram deliveries are recorded as undelivered, but **V3 does not retry** them. Deleted monitor samples remain in SQLite until regular retention cleanup or manual maintenance.
-
-## V3 status and next steps
-
-- Automatic monitoring, threshold alerts, Telegram send and TCP check are implemented; automated tests use mocked AWS APIs and Telegram. Real AWS integration and Telegram delivery have **not** been exercised in this package.
-- No static-IP rotation, Lightsail monthly quota tracking, EC2 network monitoring, distributed worker coordination, MFA or React migration in V3.
-- API values and errors are sanitized but the UI remains a small vanilla JS single-admin tool; review IAM and reverse-proxy protection before deploying publicly.
-
-Test in development with `python -m pytest -q` and `node --check` on the extracted UI script.
-
----
-
-## V4.0 更新（兼容 V3 的 SQLite 数据文件）
-
-### 新增功能
-
-- Lightsail 静态 IP 列表（逐页拉取），新建、绑定、解绑和释放。
-- 释放静态 IP 前，必须再次输入准确名称；后端会拒绝释放仍然挂载的 IP。
-- 每次通过 `/api/ip/check` 发起的 TCP 端口检测会写入 `ip_checks` 表；`/api/ip/history` 提供历史检索。
-- `/api/lightsail/allowance` 查询实例对应的 Lightsail bundle 元数据，展示 `transferPerMonthInGb` 和标称套餐价格。**并非账单流量、当月实际用量或剩余流量**，不可据此自动判断是否超出 AWS 套餐。
-- Web 界面新增「静态 IP」管理和检测历史页；不修改 V3 数据表结构，升级会自动创建新的 `ip_checks` 表。
-
-### IAM 权限
-
-为使用静态 IP 管理，需要针对所管理 Lightsail 资源授予 `lightsail:GetStaticIps`、`lightsail:GetStaticIp`、`lightsail:AllocateStaticIp`、`lightsail:AttachStaticIp`、`lightsail:DetachStaticIp`、`lightsail:ReleaseStaticIp`、`lightsail:GetInstance`、`lightsail:GetBundles` 等权限。请按 AWS IAM 官方服务授权参考核对操作名称、区域和资源粒度，并按需授权，而不是直接使用 `AdministratorAccess`。
-
-### 升级
-
-1. 停止 V3 服务：`docker compose down`。
-2. 备份 `.env`、`data/` 和 AWS 凭据。不要删除 `data/control.db`。
-3. 用 V4 源码覆盖程序文件，保留 `.env`、`data/`。
-4. 执行 `docker compose up -d --build`，浏览器硬刷新页面。
-5. 执行 `docker compose logs --tail 100 aws-control-center aws-monitor-worker` 查看服务日志。
-
-### 限制及部署安全
-
-- 静态 IP 释放是危险操作，释放后旧地址不能保证重新申请得到；页面要求人工确认。请先核对安全组、防火墙、DNS 和外部依赖。
-- AWS 静态 IP 分配、未绑定资源或其他相关服务可能产生费用；操作调用成功并不等于目标状态立即生效。
-- IP 健康检查仅限从面板所在服务器探测当前 AWS 返回的公网 IPv4 的 TCP 22、80、443，不代表全球连通性。
-- 单管理员安全模型依然是早期版本，生产公网部署前需要额外的 MFA、细粒度 RBAC、TLS、访问控制和独立审计备份。
-- 本地使用 Mock AWS Client 的 10 项自动化测试通过，但本环境未连接真实 AWS 账户，也未实际启动 Docker 容器。
-
----
-
-## V4.1: 原生 Linux 命令行部署（无需 Docker）
-
-支持 Ubuntu / Debian 等 **systemd Linux** 系统和 Python 3.10+；需已有 `python3-venv`、pip 可用、联网安装 Python 依赖。与 Docker 模式二选一，**不要同时运行**，以避免端口冲突和重复采集。
-
-### 快速安装（仅本机监听）
-
-```bash
-# Ubuntu/Debian 先确保依赖已安装
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip curl
-
-# 在解压源码后的 aws-control-center 目录执行
-sudo bash deploy/install.sh --user "$USER"
-sudo awscc status
-sudo awscc health
-sudo grep '^APP_PASSWORD=' /etc/aws-control-center/awscc.env
-```
-
-程序默认监听 `127.0.0.1:8000`，**不会直接暴露公网**。本地 HTTP 模式设置 `COOKIE_SECURE=false`；通过 SSH 隧道安全访问，例如本机运行 `ssh -L 8000:127.0.0.1:8000 user@server`，访问 `http://127.0.0.1:8000`。
-
-AWS 凭据默认使用安装指定用户的 `~/.aws/config` 和 `~/.aws/credentials`，与 Docker 挂载的 `~/.aws` 相互独立，确保对应非 root 用户具有读取权限。EC2 Instance Profile 默认禁用，如需实例角色需按实际环境调整（不要无意打开元数据访问）。
-
-### 原生部署启动时报虚拟环境权限错误
-
-如果日志出现 `PermissionError: ... /opt/aws-control-center/.venv/pyvenv.cfg`，旧版安装器首次创建配置后的 `umask 077` 会导致 root 创建的虚拟环境无法被服务用户读取。可以在服务器执行：
-
-```bash
-sudo chmod -R go+rX /opt/aws-control-center/.venv
-sudo awscc restart
-sudo awscc health
-sudo awscc status
-```
-
-这里只补充虚拟环境的读取和目录遍历权限，不增加写权限。新版安装和升级脚本已修复此问题，并会修复已有虚拟环境的权限。
-
-### 带域名和现有 TLS 证书的 Nginx 部署
-
-```bash
-sudo apt install -y nginx
-sudo bash deploy/install.sh --user "$USER" \
-  --domain aws.example.com \
-  --tls-cert /etc/letsencrypt/live/aws.example.com/fullchain.pem \
-  --tls-key /etc/letsencrypt/live/aws.example.com/privkey.pem
-```
-
-**注意：** 证书必须事先获取且可供 Nginx 读取。安装器不自动申请证书，也不会修改防火墙策略、开放端口或创建 DNS 记录。若前置 aaPanel/Nginx 已有代理，直接采用仅本机监听的方式，配置 HTTPS 反代到 `127.0.0.1:8000`，并将 `/etc/aws-control-center/awscc.env` 的 `COOKIE_SECURE` 改为 `true` 后执行 `sudo awscc restart`。
-
-### CLI 管理命令
-
-```bash
-sudo awscc status         # systemd 状态
-sudo awscc start          # 启动 Web 和 Worker
-sudo awscc stop           # 停止 Web 和 Worker
-sudo awscc restart        # 重启
-sudo awscc logs           # 实时全部日志
-sudo awscc web-logs       # Web 日志
-sudo awscc worker-logs    # Worker 日志
-sudo awscc health         # 本机 HTTP 健康探测
-sudo awscc backup         # SQLite 一致性备份到 /var/backups
-sudo awscc upgrade /path/to/new/aws-control-center  # 备份并升级（保留配置及数据）
-```
-
-- 代码：`/opt/aws-control-center/`
-- 环境配置：`/etc/aws-control-center/awscc.env`，仅 root 可读
-- 数据库：`/var/lib/aws-control-center/control.db`（归部署用户所有）
-- 后台服务：`awscc-web.service`、`awscc-worker.service`（独立进程）
-- 安全：默认单进程 Web、单进程 Worker、localhost 绑定、systemd 限制写入目录；此版本依然缺乏 MFA/RBAC，公网部署必须添加独立身份认证或零信任访问控制。
-
-**升级 V4 Docker 用户注意：** 原生部署不会自动读取旧项目的 `./data/control.db`。如需迁移，停止旧容器/服务后备份 SQLite，人工复制数据库文件及关联数据，调整属主，再启动新服务，避免两个 Worker 同时采集。不要把凭据复制进 Web 静态目录。
-
----
-
-## V5 — AWS Resource CLI (native Linux deployment)
-
-V5 extends V4.1 with AWS resource commands, using **the existing Python `app.py` AWS implementation**, account aliases, region allowlist and SQLite audit database. Commands execute locally under the **same non-root service identity** as the Web process; the launcher reads the root-restricted configuration then drops privileges before running resource commands. No Web login, cookies or CSRF token is used by the local CLI. Protect `sudo` permissions appropriately.
-
-### Upgrade from V4.1
-
-Back up the current installation and unpack this ZIP to a staging directory:
-
-```bash
-sudo awscc backup
-unzip aws-control-center-v5.zip
-sudo awscc upgrade ./aws-control-center
-sudo awscc status
-```
-
-`awscc upgrade` installs `cli.py`, `deploy/awscc` and the CLI launcher in addition to existing backend files. It preserves `/etc/aws-control-center/awscc.env` and `/var/lib/aws-control-center/control.db`. Run commands with `sudo` on the host where native systemd deployment was installed. **This new resource CLI is not installed inside the Docker container by default**; Docker retains the Web dashboard/worker.
-
-For a fresh native installation:
-
-```bash
-sudo bash deploy/install.sh --user "$USER"
-sudo awscc status
-sudo awscc instances list --service lightsail --region ap-northeast-1
-```
-
-### Resource commands
-
-```bash
-# Inventory and exportable JSON output
-sudo awscc instances list --profile default --region all --service all
-sudo awscc instances list --profile default --region ap-northeast-1 --service lightsail --json
-
-# Lifecycle commands: interactive confirmation; --yes for unattended scripts
-sudo awscc instances stop --service ec2 --region us-east-1 --name i-1234567890abcdef0 --yes
-sudo awscc instances start --service ec2 --region us-east-1 --name i-1234567890abcdef0 --yes
-sudo awscc instances reboot --service lightsail --region ap-northeast-1 --name my-server
-
-# Lightsail static IP operations
-sudo awscc ip list --region ap-northeast-1
-sudo awscc ip allocate --region ap-northeast-1 --name my-static-ip
-sudo awscc ip attach --region ap-northeast-1 --name my-static-ip --instance my-server
-sudo awscc ip detach --region ap-northeast-1 --name my-static-ip
-sudo awscc ip release --region ap-northeast-1 --name my-static-ip
-
-# Reports / account aliases / audit
-sudo awscc traffic report --region ap-northeast-1 --instance my-server --days 7 --json
-sudo awscc cost report --profile default --json
-sudo awscc accounts list
-sudo awscc audit list --limit 50
-```
-
-Do **not** use `instances restart`: the actual supported command is `instances reboot`. `--profile` accepts either a local shared AWS profile or a Web-configured AssumeRole alias. `--region all` works for inventory only; any write or single-instance report needs a specific region. A write in a non-interactive shell **must** include `--yes`; the confirmation is not an AWS dry-run. All CLI mutations have AWS side effects and may incur charges; IP allocation may also incur charges.
-
-The CLI supports `--json` (positioned at command end) for automation. Exit codes: `0` success, `1` API/operation failure, `2` argument/confirmation error, `3` inventory partial failure (results may still have been printed). Never mistake the CloudWatch sample sum for Lightsail billed monthly allowance.
-
-### CLI limitations
-
-- Requires native Linux/systemd install; no Windows installer yet.
-- CLI runs under the same privilege set as the single-admin Web backend. There is no additional CLI RBAC policy.
-- AWS SDK may retry transient failures and state changes are asynchronous; a submitted operation is not proof that the requested final instance state was reached.
-- No automatic IP rotation, bulk provisioning, or task queue is implemented in this version.
-- `--yes` disables interactive confirmation: allow it only in carefully reviewed scripts and tightly scoped IAM roles.
-- For `.env` values with unusual quoting, use simple `KEY=value` assignments. The native CLI launcher is not a full shell parser. Do not store multiline values in this file.
-
-### Tests
-
-`python -m pytest -q` — 16 tests passing locally (mocked AWS APIs). `python -m py_compile ...`, `bash -n deploy/awscc deploy/install.sh`, and ZIP integrity checked. Real AWS changes, end-to-end systemd deployment and Nginx were **not** tested in this environment.
-
-## V8 — React/TypeScript 管理后台（渐进迁移）
-
-V8 提供可选的 `frontend/` React 18 + TypeScript + Ant Design 5 管理界面源码：资源看板、实例清单、创建任务自动轮询（10 秒）、AWS 实例状态核验。**此版本并非全站 React 重写**：静态 IP、监控告警、角色配置、创建表单、审计等仍在 `/legacy` 页面可用。
-
-V8 的新增 `/api/dashboard/summary` 接口汇总跨区域实例、运行状态、任务状态与 24 小时告警；接口会保留部分 AWS 区域失败信息。跨区域扫描产生 AWS API 调用，请控制刷新频率。旧版任务页也增加 10 秒可见性轮询，不会自动重试创建请求。
-
-### 构建新 UI（需要 Node.js 20.19+ 或 22.12+、可访问 npm Registry）
+### 原生 Linux / aaPanel
 
 ```bash
 cd frontend
-npm install
+npm ci
+npm run typecheck
 npm run build
 cd ..
+sudo bash deploy/install.sh --user "$USER"
+sudo awscc status
+sudo awscc health
 ```
 
-构建输出到 `static/v8/`。如果构建产物存在，根路径 `/` 自动提供 React 管理界面；否则自动回退原有 HTML 管理界面。`/legacy` 始终访问旧版全功能页面。Docker 镜像只复制已经构建的 `static/`，不要求在容器启动时安装 npm。Linux 原生安装脚本也复制 `static/`。Vite 开发服务器 `/api` 默认代理到 `127.0.0.1:8000`，需先启动 FastAPI 后端。
+源代码与运行目录分开。升级前在源目录完成前端构建，再执行：
 
-**安全与升级**：先备份 `.env` 和 SQLite。React 界面复用现有 HttpOnly Session 与 CSRF 机制。V8 不改变数据库表结构，不引入新的 systemd 服务。构建成功之前请继续使用 V7/V8 兼容页面；实际 AWS、Docker 和生产 Nginx 环境仍须单独联调。
+```bash
+sudo awscc upgrade /path/to/aws-control-center
+```
 
-## V9 — React 统一管理控制台
+安装器要求存在 `static/app/index.html`。没有构建产物时主页返回 503，不再回退旧 UI。
 
-V9 迭代将原先仅有资源看板/清单的 React 页面扩展至实例启停及批量操作、Lightsail 创建任务表单、静态 IP 操作、监控规则与告警、跨账户 IAM Role、审计日志。依旧保留 `/legacy` 页面作为兼容入口，API、CLI 和数据库沿用 V8。
+服务是 `awscc-web`、`awscc-worker`、`awscc-task-worker`。工作进程均需要同一数据目录、配置和加密密钥。不要额外运行旧版 Worker。
 
-请阅读 `V9_UPGRADE.md` 的具体构建和升级命令。注意 React UI **尚未在本执行环境完成 npm 安装、类型检查或生产构建**；原因是 npm Registry DNS 请求失败。后端测试不能代替前端构建和真实 AWS 联调。
+## 使用流程
+
+1. 添加 AWS 账户，验证身份；等待后台清单更新，或请求刷新清单。
+2. 在创建页选择账户、区域与服务，填写配置、模板或脚本。
+3. 核对预览中的账户、区域、实例及关联磁盘策略，输入 `EXECUTE`；删除需输入 `DELETE`。
+4. 在任务中心查看 AWS 提交与最终资源核验。实例运行不代表初始化已完成，可配置 SSH 后执行“核验初始化”。
+5. 创建 SSH 连接时，通过可信渠道核对主机指纹；私钥/密码只在提交时传送，不回显。复制连接版本时需重新提供凭据。
+6. 在监控规则选择实例、窗口和阈值。默认只通知；明确选择自动执行模式后，按动作顺序执行脚本和停机。
+
+同名规则保存新版本时会停用旧版本；任务已保存配置快照。全局暂停阻止未开始的自动化动作，不会终止已经运行的远程命令。
+
+## 监控与可靠性
+
+- 默认 5 分钟采样；已开启详细监控的 EC2 可选择 1 分钟。不会自动开启付费详细监控。监控 Worker 默认每 5 分钟评估一次（可设置 MONITOR_INTERVAL_SECONDS，最低 60 秒），预留 10 分钟指标延迟。
+- 首次采集回填最近 30 天及当月可用数据；1 分钟数据首次回填限制为 14 天。回填后仍有缺失的窗口不会执行自动资源修改。
+- 最近 2 小时重复拉取并更新同一个时间桶，不能累加重叠窗口。原始数据保留 14 天，小时聚合 90 天，日聚合 730 天。
+- 已知创建时间的实例从创建后的完整采样周期计算覆盖率；外部 EC2 不使用可能随开机变化的 LaunchTime 假定创建时间。
+- 默认连续两次完整评估超限触发；冷却 3,600 秒，恢复阈值为触发值的 90%，每条规则每天最多触发 3 次，可修改。
+- 持续超限默认只触发一次；滑动窗口恢复后重置，自然日/月规则在周期切换后重新布防。
+- 自动化触发事件先落库，通过固定事件标识关联任务；丢失回执后复用同一任务。Telegram 通知最多尝试 5 次，不阻塞实例动作。
+- 修改 AWS 资源的 SDK 调用禁止自动重放。超时、服务端不明确错误或 Worker 租约中断进入 `unknown`，先核验再决定是否新建任务。
+- EC2 创建使用稳定 ClientToken；Lightsail 使用任务标签核验归属。重启核验只证明 AWS 请求被接受，结果标注 `request_accepted`。
+- 任务 Worker 默认最多 5 个执行线程，SSH 最多 2 个并行。自动化同一任务的步骤顺序执行，脚本超时后仍可继续停机。
+
+`control.db` 保存账户、配置、任务与审计；`metrics.db` 保存指标。连接凭据、模板和任务执行配置使用现有 Fernet 密钥加密。root 明文密码不写入任务，启动数据仍会传给 AWS；不要将长期秘密写入自定义脚本。
+
+## API 与 CLI
+
+主要接口：
+
+| 接口 | 用途 |
+| --- | --- |
+| `/api/login`、`/api/session`、`/api/logout` | 登录、会话与 CSRF |
+| `/api/key-accounts`、`/api/accounts`、`/api/account-settings` | 凭据、角色、分组和启用状态 |
+| `/api/resources`、`/api/resources/refresh` | 缓存查询与请求刷新 |
+| `/api/catalog` | 区域创建选项 |
+| `/api/tasks/preview`、`/api/tasks` | 固定预览与确认入队 |
+| `/api/tasks/{id}`、`cancel`、`verify` 子路径 | 任务详情、取消与核验 |
+| `/api/configurations?kind=bootstrap\|script\|connection\|rule` | 版本化配置 |
+| `/api/traffic`、`/api/traffic/summary` | 单实例流量与监控资源汇总 |
+| `/api/events`、`/api/rules/{id}/simulate` | 触发历史与模拟 |
+| `/api/automation/pause?paused=true` | 全局暂停 |
+| `/api/health`、`/api/audit`、`/api/cost` | 状态、审计与成本 |
+
+所有 API 需要登录；修改操作需要 `X-AWSCC-CSRF`。费用可使用 `profile=all`，清单使用 `profiles` 逗号列表。前端轮询缓存和任务，不持续调用全量 AWS 扫描。
+
+原生 CLI 与 Web 复用同一服务层，使用服务用户身份：
+
+```bash
+sudo awscc instances list --profile all --json
+sudo awscc tasks list --json
+sudo awscc tasks show TASK_ID --json
+sudo awscc tasks verify TASK_ID --yes
+sudo awscc tasks cancel TASK_ID --yes
+sudo awscc configurations list --kind rule
+sudo awscc rules save --file rule.json --yes
+sudo awscc rules disable RULE_ID --yes
+sudo awscc traffic report --profile default --region us-east-1 --service ec2 --instance i-EXAMPLE --window 7d
+sudo awscc automation pause --yes
+sudo awscc automation resume --yes
+sudo awscc automation events
+sudo awscc cost report --profile all
+```
+
+批量任务 JSON 示例，先保存为 `task.json`：
+
+```json
+{
+  "request_key": "replace-with-a-unique-uuid",
+  "items": [{
+    "kind": "stop",
+    "target": {"profile": "default", "region": "us-east-1", "service": "lightsail", "instance": "my-server"}
+  }]
+}
+```
+
+执行 `sudo awscc tasks preview --file task.json`，将返回的 `preview_id` 和 `confirm: "EXECUTE"` 加入同一文件，保留原 `request_key`，再执行 `sudo awscc tasks submit --file task.json --yes`。预览 15 分钟有效；请求不明确时保留标识，检查任务而不是换标识重试。
+
+## IAM 权限与网络
+
+按使用的功能分别授权，避免直接使用 AdministratorAccess：
+
+- 身份：`sts:GetCallerIdentity`，角色账户另需 `sts:AssumeRole` 与目标信任关系。
+- EC2：实例、镜像、规格、子网、VPC、安全组、密钥对、启动模板及实例属性的 Describe 权限；按需授予 `RunInstances`、`CreateTags`、`StartInstances`、`StopInstances`、`RebootInstances`、`TerminateInstances`。
+- 实例角色需要针对指定角色的 `iam:PassRole`；主机 SSH 脚本不使用面板的 AWS 密钥。
+- Lightsail：实例、区域、套餐、镜像、密钥对和指标查询；按需授权创建、删除、启停、重启及静态 IP 操作。
+- 流量：EC2 需要 `cloudwatch:GetMetricStatistics`；Lightsail 需要 `lightsail:GetInstanceMetricData`。
+- 成本：`ce:GetCostAndUsage` 与账户账单访问能力。
+
+权限错误会显示在清单、预览、任务或采集详情中。创建预览仅验证配置与元数据，不能保证提交时的配额、容量或所有写入权限。
+
+SSH 必须从面板服务器到实例可达，安全组及主机防火墙应允许相应来源。仅接受 AWS 返回的实例地址，拒绝回环、链路本地、组播等地址，主机指纹变化会阻止执行。
+
+## 升级、备份和历史数据
+
+升级前备份配置、数据库和加密密钥。原生部署执行：
+
+```bash
+sudo awscc backup
+```
+
+备份位于 `/var/backups/aws-control-center/`，包含两份 SQLite 一致性备份、`credential.key` 和配置，文件权限为 0600。使用环境变量加密密钥时必须保留对应配置。Docker 部署可停止三个服务后备份 `.env` 和整个 `data/`，再启动服务。
+
+升级采用新增表迁移，不删除已有记录：
+
+- 旧创建任务在新任务中心显示为 `archived`，保留原提交状态；不会自动继续旧版尚未完成的创建请求。
+- 旧监控规则由新 Worker 验证资源后一次性导入，仅通知，不启用自动资源动作。无法访问的实例以禁用规则导入并标记复核，原数据仍保留；重新启用时再次验证账户和实例身份。
+- 旧一小时滑动窗口采样不进入新日/月累计，避免重复统计。
+- 旧告警和采样通过新事件接口提供历史记录，不恢复旧 API 或页面。
+
+回退需要停止全部服务，恢复匹配版本的代码、数据库、密钥和配置；不要将旧 Worker 指向已经运行新任务的数据库。
+
+## 开发验证
+
+```bash
+python -m pip install -r requirements.txt pytest httpx
+python -m pytest -q
+cd frontend
+npm ci
+npm run typecheck
+npm run build
+```
+
+CI 执行后端测试、前端类型检查和生产构建，以及 Linux 脚本语法检查。测试使用临时数据库和模拟 AWS/SSH，不创建真实实例。
+
+本次实现完成本地接口与生产构建验证；真实 AWS 创建/删除、Linux 各发行版 cloud-init、Docker/systemd/aaPanel 部署及真实 SSH 连通性仍需目标环境联调。浏览器控制服务在本次环境不可用，未完成交互式浏览器验收。
+
+当前支持单管理员和单机部署；没有团队 RBAC、Spot、自动创建网络、进程级流量 Agent、自动创建/删除/替换实例规则。规则支持显式实例集合或标签动态匹配，可逐实例或按集合汇总判断；每条规则最多 100 台，触发时冻结目标。

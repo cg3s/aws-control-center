@@ -1,3 +1,5 @@
+> 历史文档：当前仅维护新版 UI 与一套 API，请以 [README](README.md) 的安装、接口和迁移说明为准。
+
 # AWS Control Center V9.0 升级说明
 
 ## 本次功能

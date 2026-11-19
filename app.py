@@ -1,4 +1,4 @@
-"""AWS Control Center v9: self-hosted single-admin API."""
+"""AWS Control Center: self-hosted single-admin API."""
 import json
 import ipaddress
 import socket
@@ -7,10 +7,9 @@ import os
 import re
 import secrets
 import sqlite3
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import boto3
@@ -21,6 +20,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
+from controlplane.store import ClosingConnection
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv('DATA_DIR', str(ROOT / 'data')))
@@ -37,20 +37,20 @@ TTL = 8 * 3600
 AWS_CONFIG = Config(connect_timeout=5, read_timeout=18, retries={'max_attempts': 2, 'mode': 'standard'})
 logger = logging.getLogger('awscc')
 logging.basicConfig(level=logging.INFO)
-app = FastAPI(title='AWS Control Center v9.1', docs_url=None, redoc_url=None)
+app = FastAPI(title='AWS Control Center', docs_url=None, redoc_url=None)
 
 
 @app.exception_handler(RequestValidationError)
 async def safe_validation_error(request: Request, exc: RequestValidationError):
     if request.url.path == '/api/key-accounts':
         return JSONResponse(status_code=422, content={'detail': 'Invalid AWS credential form fields'})
-    if request.url.path == '/api/tasks/lightsail/create':
-        return JSONResponse(status_code=422, content={'detail': 'Invalid create form fields; check names, sizes and launch configuration'})
+    if request.url.path.startswith('/api/tasks') or request.url.path.startswith('/api/configurations'):
+        return JSONResponse(status_code=422, content={'detail': 'Invalid request fields; check configuration and task inputs'})
     return JSONResponse(status_code=422, content={'detail': exc.errors()})
 
 
 def db():
-    c = sqlite3.connect(DB_PATH, timeout=10)
+    c = sqlite3.connect(DB_PATH, timeout=10, factory=ClosingConnection)
     c.row_factory = sqlite3.Row
     c.execute('PRAGMA journal_mode=WAL')
     c.execute('PRAGMA busy_timeout=10000')
@@ -212,9 +212,9 @@ def aws_session(profile):
         return boto3.Session(aws_access_key_id=item['access_key_id'],
                              aws_secret_access_key=secret)
     source = item['source_profile']
-    if source not in base_profiles():
+    if source not in base_profiles() + [x['alias'] for x in saved_keys()]:
         raise HTTPException(400, 'Configured source profile no longer exists')
-    original = boto3.Session() if source == 'default' else boto3.Session(profile_name=source)
+    original = aws_session(source)
     args = {'RoleArn': item['role_arn'], 'RoleSessionName': 'AWSControlCenter'}
     if item['external_id']:
         args['ExternalId'] = item['external_id']
@@ -242,18 +242,6 @@ class Login(BaseModel):
     password: str
 
 
-class InstanceAction(BaseModel):
-    service: str
-    profile: str
-    region: str
-    instance: str = Field(min_length=1, max_length=200)
-    action: str
-
-
-class BatchAction(BaseModel):
-    items: list[InstanceAction] = Field(min_length=1, max_length=20)
-
-
 class RoleAccount(BaseModel):
     alias: str = Field(min_length=2, max_length=40)
     source_profile: str
@@ -269,14 +257,6 @@ class KeyAccountIn(BaseModel):
 
 class ActivateAccountIn(BaseModel):
     alias: str = Field(min_length=1, max_length=80)
-
-
-class MonitorIn(BaseModel):
-    profile: str = Field(min_length=1, max_length=80)
-    region: str
-    instance: str = Field(min_length=1, max_length=200)
-    threshold_gib: float = Field(gt=0, le=100000)
-    enabled: bool = True
 
 
 class StaticIpAction(BaseModel):
@@ -297,54 +277,21 @@ class IpCheck(BaseModel):
 
 @app.get('/')
 def home():
-    modern = ROOT / 'static' / 'v8' / 'index.html'
-    return FileResponse(modern if modern.is_file() else ROOT / 'static' / 'index.html', headers={'Cache-Control': 'no-store'})
+    modern = ROOT / 'static' / 'app' / 'index.html'
+    if not modern.is_file():
+        return JSONResponse(status_code=503, content={'detail': 'Build the frontend before starting the control center'})
+    return FileResponse(modern, headers={'Cache-Control': 'no-store'})
 
 
-@app.get('/legacy')
-def legacy_home():
-    return FileResponse(ROOT / 'static' / 'index.html', headers={'Cache-Control': 'no-store'})
-
-
-@app.get('/v8/assets/{filename}')
+@app.get('/assets/{filename}')
 def modern_asset(filename: str):
     # Only serve hashed build products from the fixed directory, never arbitrary paths.
     if not re.fullmatch(r'[a-zA-Z0-9_.-]+\.(?:js|css|svg|png)', filename):
         raise HTTPException(404, 'Not found')
-    target = ROOT / 'static' / 'v8' / 'assets' / filename
+    target = ROOT / 'static' / 'app' / 'assets' / filename
     if not target.is_file():
         raise HTTPException(404, 'Not found')
     return FileResponse(target)
-
-
-@app.get('/api/dashboard/summary', dependencies=[Depends(auth)])
-def dashboard_summary(profile: str = 'default', region: str = 'all', service: str = 'all'):
-    # Costs no extra AWS calls compared with inventory, and retains partial failures.
-    data = instances(profile=profile, service=service, region=region)
-    resources = data['items']
-    with db() as conn:
-        try:
-            task_counts = {r['status']: r['n'] for r in conn.execute(
-                'SELECT status, COUNT(*) AS n FROM tasks GROUP BY status')}
-        except sqlite3.OperationalError as e:
-            if 'no such table' not in str(e).lower():
-                raise
-            task_counts = {}
-        recent_alerts = conn.execute('SELECT COUNT(*) FROM alerts WHERE created_at >= ?',
-            ((datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(timespec='seconds'),)).fetchone()[0]
-    by_region = {}
-    by_service = {}
-    states = {}
-    for item in resources:
-        for grouping, key in ((by_region, item['region']), (by_service, item['service']), (states, item['state'])):
-            grouping[key] = grouping.get(key, 0) + 1
-    return {'profile':profile,'region':region,'service':service,
-            'total':len(resources),'running':sum(1 for i in resources if i['state']=='running'),
-            'stopped':sum(1 for i in resources if i['state']=='stopped'),
-            'by_region':by_region,'by_service':by_service,'by_state':states,
-            'task_counts':task_counts,'alerts_24h':recent_alerts,'errors':data['errors'],
-            'generated_at':datetime.now(timezone.utc).isoformat(timespec='seconds')}
-
 
 
 @app.post('/api/login')
@@ -360,6 +307,7 @@ def login(data: Login, request: Request, response: Response):
             start = now if count == 1 else old['window_start']
             locked = now + 900 if count >= 5 else 0
             c.execute('INSERT OR REPLACE INTO attempts VALUES(?,?,?,?)', (ip, count, start, locked))
+            c.commit()  # HTTPException otherwise rolls back the failed-attempt counter.
             raise HTTPException(401, 'Invalid password')
         c.execute('DELETE FROM attempts WHERE ip=?', (ip,))
         c.execute('DELETE FROM sessions WHERE expiry<?', (now,))
@@ -397,11 +345,11 @@ def list_accounts():
 
 @app.post('/api/accounts', dependencies=[Depends(auth)])
 def create_account(item: RoleAccount, request: Request):
-    if not re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_-]{1,39}', item.alias):
+    if item.alias == 'all' or not re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_-]{1,39}', item.alias):
         raise HTTPException(400, 'Invalid alias')
     if item.alias in available_profiles():
         raise HTTPException(409, 'Alias conflicts with an AWS profile')
-    if item.source_profile not in base_profiles():
+    if item.source_profile not in base_profiles() + [x['alias'] for x in saved_keys()]:
         raise HTTPException(400, 'Source profile must exist')
     if not re.fullmatch(r'arn:aws[a-zA-Z-]*:iam::\d{12}:role/[\w+=,.@/-]+', item.role_arn):
         raise HTTPException(400, 'Invalid IAM role ARN')
@@ -417,6 +365,7 @@ def create_account(item: RoleAccount, request: Request):
 
 @app.delete('/api/accounts/{alias}', dependencies=[Depends(auth)])
 def remove_account(alias: str, request: Request):
+    check_account_dependencies(alias)
     with db() as c:
         count = c.execute('DELETE FROM accounts WHERE alias=?', (alias,)).rowcount
     if not count:
@@ -489,16 +438,8 @@ def activate_key_account(item: ActivateAccountIn, request: Request):
 
 @app.delete('/api/key-accounts/{alias}', dependencies=[Depends(auth)])
 def delete_key_account(alias: str, request: Request):
+    check_account_dependencies(alias)
     with db() as c:
-        if c.execute('SELECT 1 FROM monitors WHERE profile=? LIMIT 1',(alias,)).fetchone():
-            raise HTTPException(409, 'Remove monitoring rules for this account first')
-        # Existing queued work must not silently run on a removed account.
-        try:
-            if c.execute("SELECT 1 FROM tasks WHERE profile=? AND status IN ('queued','running') LIMIT 1",(alias,)).fetchone():
-                raise HTTPException(409, 'Cancel or finish queued tasks before removing account')
-        except sqlite3.OperationalError as e:
-            if 'no such table' not in str(e):
-                raise
         count = c.execute('DELETE FROM key_accounts WHERE alias=?',(alias,)).rowcount
         if not count:
             raise HTTPException(404, 'Saved credential not found')
@@ -528,6 +469,9 @@ def scan_one(session, profile, region, service):
                     rows.append({'service': 'lightsail', 'profile': profile, 'region': region,
                                  'id': x['name'], 'name': x['name'], 'state': x.get('state', {}).get('name', 'unknown'),
                                  'ip': x.get('publicIpAddress', ''), 'private_ip': x.get('privateIpAddress', ''),
+                                 'tags': {t['key']: t.get('value','') for t in x.get('tags', [])},
+                                 'generation': x.get('arn', '')+'/'+str(x.get('createdAt', '')),
+                                 'created_at': x['createdAt'].isoformat() if isinstance(x.get('createdAt'), datetime) else str(x.get('createdAt', '')),
                                  'type': x.get('bundleId', ''), 'zone': x.get('location', {}).get('availabilityZone', '')})
                 token = data.get('nextPageToken')
                 if not token:
@@ -544,13 +488,15 @@ def scan_one(session, profile, region, service):
                         rows.append({'service': 'ec2', 'profile': profile, 'region': region,
                                      'id': x['InstanceId'], 'name': name, 'state': x.get('State', {}).get('Name', 'unknown'),
                                      'ip': x.get('PublicIpAddress', ''), 'private_ip': x.get('PrivateIpAddress', ''),
+                                     'tags': {t['Key']: t.get('Value','') for t in x.get('Tags', [])}, 'generation': x['InstanceId'],
+                                     'created_at': next((t['Value'] for t in x.get('Tags', []) if t['Key']=='awscc-created-at'), ''),
+                                     'detailed_monitoring': x.get('Monitoring', {}).get('State') == 'enabled',
                                      'type': x.get('InstanceType', ''), 'zone': x.get('Placement', {}).get('AvailabilityZone', '')})
         except (ClientError, BotoCoreError) as e:
             failures.append({'region': region, 'service': 'ec2', 'message': aws_error(e)})
     return rows, failures
 
 
-@app.get('/api/instances', dependencies=[Depends(auth)])
 def instances(profile: str = 'default', service: str = 'all', region: str = 'all'):
     if service not in ('all', 'lightsail', 'ec2'):
         raise HTTPException(400, 'Unsupported service')
@@ -575,91 +521,6 @@ def instances(profile: str = 'default', service: str = 'all', region: str = 'all
         raise HTTPException(502, aws_error(e))
 
 
-def invoke_action(data: InstanceAction):
-    check_region(data.region)
-    if data.action not in ('start', 'stop', 'reboot') or data.service not in ('lightsail', 'ec2'):
-        raise HTTPException(400, 'Unsupported action/service')
-    api = client(data.profile, data.service, data.region)
-    if data.service == 'ec2':
-        if not re.fullmatch(r'i-[0-9a-f]{8,17}', data.instance):
-            raise HTTPException(400, 'Invalid EC2 instance ID')
-        fn = {'start': 'start_instances', 'stop': 'stop_instances', 'reboot': 'reboot_instances'}[data.action]
-        getattr(api, fn)(InstanceIds=[data.instance])
-    else:
-        fn = {'start': 'start_instance', 'stop': 'stop_instance', 'reboot': 'reboot_instance'}[data.action]
-        getattr(api, fn)(instanceName=data.instance)
-
-
-@app.post('/api/instance/action', dependencies=[Depends(auth)])
-def action(data: InstanceAction, request: Request):
-    info = dict(ip=ip_of(request), category='instance', profile=data.profile, region=data.region,
-                service=data.service, resource=data.instance, operation=data.action)
-    try:
-        invoke_action(data)
-        audit(**info, result='submitted')
-        return {'ok': True, 'message': 'AWS accepted the operation'}
-    except (ClientError, BotoCoreError, HTTPException) as e:
-        message = e.detail if isinstance(e, HTTPException) else aws_error(e)
-        audit(**info, result='failed', detail=str(message))
-        if isinstance(e, HTTPException):
-            raise
-        raise HTTPException(502, message)
-
-
-@app.post('/api/instance/batch', dependencies=[Depends(auth)])
-def batch_action(data: BatchAction, request: Request):
-    if len({(x.profile, x.region, x.service, x.instance) for x in data.items}) != len(data.items):
-        raise HTTPException(400, 'Duplicate instances in batch')
-    # Sequential and bounded to avoid sudden high-volume state changes.
-    results = []
-    for x in data.items:
-        info = dict(ip=ip_of(request), category='instance', profile=x.profile, region=x.region,
-                    service=x.service, resource=x.instance, operation=x.action)
-        try:
-            invoke_action(x)
-            result, detail = 'submitted', ''
-        except (ClientError, BotoCoreError, HTTPException) as e:
-            result = 'failed'
-            detail = str(e.detail) if isinstance(e, HTTPException) else aws_error(e)
-        audit(**info, result=result, detail=detail)
-        results.append({'instance': x.instance, 'region': x.region, 'service': x.service, 'result': result, 'message': detail})
-    return {'items': results, 'submitted': sum(x['result'] == 'submitted' for x in results)}
-
-
-@app.get('/api/traffic', dependencies=[Depends(auth)])
-def traffic(profile: str, region: str, instance: str, days: int = 7, service: str = 'lightsail'):
-    check_region(region)
-    if not 1 <= days <= 30 or not 1 <= len(instance) <= 200:
-        raise HTTPException(400, 'Invalid traffic parameters')
-    if service not in ('lightsail', 'ec2'):
-        raise HTTPException(400, 'Invalid traffic service')
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=days)
-    try:
-        api = client(profile, 'lightsail' if service == 'lightsail' else 'cloudwatch', region)
-        out = {}
-        # Lightsail CloudWatch metrics NetworkIn/NetworkOut return bytes per period.
-        for metric in ('NetworkIn', 'NetworkOut'):
-            if service == 'lightsail':
-                data = api.get_instance_metric_data(instanceName=instance, metricName=metric,
-                     period=3600, startTime=start, endTime=end, unit='Bytes', statistics=['Sum'])
-                points = data.get('metricData', [])
-            else:
-                data = api.get_metric_statistics(Namespace='AWS/EC2', MetricName=metric,
-                    Dimensions=[{'Name': 'InstanceId', 'Value': instance}], Period=3600,
-                    StartTime=start, EndTime=end, Unit='Bytes', Statistics=['Sum'])
-                points = [{'timestamp': p['Timestamp'], 'sum': p.get('Sum', 0)} for p in data.get('Datapoints', [])]
-            points = sorted(points, key=lambda p: p['timestamp'])
-            out[metric] = {'bytes': round(sum(float(p.get('sum', 0) or 0) for p in points)),
-                           'points': [{'time': p['timestamp'].astimezone(timezone.utc).isoformat(),
-                                      'bytes': float(p.get('sum', 0) or 0)} for p in points]}
-        return {'instance': instance, 'region': region, 'profile': profile, 'days': days, 'service': service,
-                'start': start.isoformat(), 'end': end.isoformat(), 'metrics': out,
-                'note': 'CloudWatch sample sums only. Not Lightsail monthly billable transfer or remaining quota.'}
-    except (ClientError, BotoCoreError) as e:
-        raise HTTPException(502, aws_error(e))
-
-
 @app.get('/api/audit', dependencies=[Depends(auth)])
 def audit_list(limit: int = 100):
     if not 1 <= limit <= 500:
@@ -670,7 +531,13 @@ def audit_list(limit: int = 100):
 
 @app.get('/api/cost', dependencies=[Depends(auth)])
 def costs(profile: str = 'default'):
-    today = date.today()
+    import sys
+    from controlplane.reports import costs as report
+    return report(sys.modules[__name__], profile, _fetch_costs)
+
+
+def _fetch_costs(profile):
+    today = datetime.now(timezone.utc).date()
     start = today.replace(day=1).isoformat()
     end = (today + timedelta(days=1)).isoformat()
     try:
@@ -686,71 +553,6 @@ def costs(profile: str = 'default'):
 
 
 # V3 monitor configuration is intentionally explicit, to avoid billing and API surprises.
-@app.get('/api/monitors', dependencies=[Depends(auth)])
-def list_monitors():
-    with db() as c:
-        rows = [dict(x) for x in c.execute('SELECT * FROM monitors ORDER BY id DESC')]
-    for x in rows:
-        x['enabled'] = bool(x['enabled'])
-    return {'items': rows}
-
-
-@app.post('/api/monitors', dependencies=[Depends(auth)])
-def save_monitor(item: MonitorIn, request: Request):
-    check_region(item.region)
-    valid_profile(item.profile)
-    # Creating a watch doesn't modify instances, but validate it exists and is Lightsail.
-    try:
-        api = client(item.profile, 'lightsail', item.region)
-        api.get_instance(instanceName=item.instance)
-    except (ClientError, BotoCoreError) as e:
-        raise HTTPException(502, aws_error(e))
-    now = datetime.now(timezone.utc).isoformat(timespec='seconds')
-    with db() as c:
-        c.execute('''INSERT INTO monitors(profile,region,instance,threshold_gib,enabled,created_at)
-                     VALUES(?,?,?,?,?,?) ON CONFLICT(profile,region,instance) DO UPDATE SET
-                     threshold_gib=excluded.threshold_gib,enabled=excluded.enabled''',
-                  (item.profile, item.region, item.instance, item.threshold_gib, int(item.enabled), now))
-    audit(ip_of(request), 'monitor', profile=item.profile, region=item.region,
-          resource=item.instance, operation='upsert', detail='One-hour network sample threshold configured')
-    return {'ok': True}
-
-
-@app.delete('/api/monitors/{monitor_id}', dependencies=[Depends(auth)])
-def delete_monitor(monitor_id: int, request: Request):
-    with db() as c:
-        row = c.execute('SELECT * FROM monitors WHERE id=?', (monitor_id,)).fetchone()
-        if row:
-            c.execute('DELETE FROM monitors WHERE id=?', (monitor_id,))
-    if not row:
-        raise HTTPException(404, 'Monitor not found')
-    audit(ip_of(request), 'monitor', profile=row['profile'], region=row['region'],
-          resource=row['instance'], operation='delete')
-    return {'ok': True}
-
-
-@app.get('/api/monitor/samples', dependencies=[Depends(auth)])
-def monitor_samples(monitor_id: int, limit: int = 96):
-    if not 1 <= limit <= 500:
-        raise HTTPException(400, 'Limit must be between 1 and 500')
-    with db() as c:
-        if not c.execute('SELECT 1 FROM monitors WHERE id=?', (monitor_id,)).fetchone():
-            raise HTTPException(404, 'Monitor not found')
-        rows = [dict(x) for x in c.execute(
-            'SELECT * FROM monitor_samples WHERE monitor_id=? ORDER BY measured_at DESC LIMIT ?',
-            (monitor_id,limit))]
-    return {'items': rows}
-
-
-@app.get('/api/alerts', dependencies=[Depends(auth)])
-def list_alerts(limit: int = 100):
-    if not 1 <= limit <= 500:
-        raise HTTPException(400, 'Limit must be between 1 and 500')
-    with db() as c:
-        rows = [dict(x) for x in c.execute('''SELECT a.*,m.profile,m.region,m.instance
-            FROM alerts a LEFT JOIN monitors m ON m.id=a.monitor_id
-            ORDER BY a.id DESC LIMIT ?''', (limit,))]
-    return {'items': rows}
 
 
 @app.post('/api/ip/check', dependencies=[Depends(auth)])
@@ -898,40 +700,25 @@ def lightsail_allowance(profile: str, region: str, instance: str):
         raise HTTPException(502, aws_error(e))
 
 
-from taskqueue import CreateBatch
-
-# V6 durable task endpoints. The task worker is an independent process.
-@app.post('/api/tasks/lightsail/create', dependencies=[Depends(auth)])
-def create_lightsail_task(request: Request, batch: 'CreateBatch'):
-    from taskqueue import submit
-    return submit(batch, actor=ip_of(request))
 
 
-@app.get('/api/tasks', dependencies=[Depends(auth)])
-def tasks_list(limit: int = 30):
-    from taskqueue import list_tasks
-    return list_tasks(limit)
+def mutation_client(profile, service, region):
+    # SDK retries must not replay ambiguous paid-resource writes or remote actions.
+    return aws_session(profile).client(service, region_name=region,
+        config=Config(connect_timeout=5, read_timeout=18, retries={'total_max_attempts': 1, 'mode': 'standard'}))
 
 
-@app.get('/api/tasks/{task_id}', dependencies=[Depends(auth)])
-def tasks_detail(task_id: str):
-    from taskqueue import detail
-    return detail(task_id)
+def check_account_dependencies(alias):
+    from controlplane.store import documents
+    with db() as c:
+        if c.execute("SELECT 1 FROM accounts WHERE source_profile=?", (alias,)).fetchone():
+            raise HTTPException(409, 'Account is used as an AssumeRole source')
+        if c.execute("SELECT 1 FROM v2_items WHERE json_extract(target,'$.profile')=? AND status NOT IN ('succeeded','failed','unknown','canceled')", (alias,)).fetchone():
+            raise HTTPException(409, 'Cancel or finish account tasks first')
+    for rule in documents(__import__(__name__), 'rule'):
+        if any(t['profile'] == alias for t in rule['payload']['targets']):
+            raise HTTPException(409, 'Remove account monitoring rules first')
 
-
-@app.post('/api/tasks/{task_id}/cancel', dependencies=[Depends(auth)])
-def tasks_cancel(task_id: str, request: Request):
-    from taskqueue import cancel
-    return cancel(task_id, actor=ip_of(request))
-
-
-@app.get('/api/lightsail/catalog', dependencies=[Depends(auth)])
-def lightsail_catalog(profile: str, region: str):
-    from taskqueue import catalog
-    return catalog(profile, region)
-
-
-@app.post('/api/tasks/{task_id}/verify', dependencies=[Depends(auth)])
-def tasks_verify(task_id: str, request: Request):
-    from taskqueue import verify_task
-    return verify_task(task_id, actor=ip_of(request))
+import sys as _sys
+from controlplane.api import register as _register_controlplane
+_register_controlplane(_sys.modules[__name__])

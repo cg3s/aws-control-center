@@ -27,10 +27,13 @@ if ! command -v python3 >/dev/null || ! python3 -c 'import sys; assert sys.versi
   echo 'Python 3.10+ is required; install python3, python3-venv and python3-pip' >&2; exit 1
 fi
 if ! python3 -m venv --help >/dev/null 2>&1; then echo 'Install python3-venv first' >&2; exit 1; fi
+[[ -f "$APP_SRC/static/app/index.html" ]] || { echo "Build frontend with npm ci and npm run build before native installation" >&2; exit 1; }
 install -d -m 0755 "$INSTALL_DIR" "$CONFIG_DIR"
 install -d -m 0700 -o "$DEPLOY_USER" -g "$(id -gn "$DEPLOY_USER")" "$DATA_DIR"
 # Never overwrite customer config and data. Avoid copying .env/AWS credentials from source.
 for p in app.py worker.py taskqueue.py cli.py requirements.txt; do install -m 0644 "$APP_SRC/$p" "$INSTALL_DIR/$p"; done
+install -d -m 0755 "$INSTALL_DIR/controlplane"
+cp -a "$APP_SRC/controlplane/." "$INSTALL_DIR/controlplane/"
 install -d -m 0755 "$INSTALL_DIR/static"
 cp -a "$APP_SRC/static/." "$INSTALL_DIR/static/"
 ENV_FILE="$CONFIG_DIR/awscc.env"
@@ -44,7 +47,7 @@ APP_PASSWORD=$PASS
 COOKIE_SECURE=$( [[ -n "$DOMAIN" ]] && echo true || echo false )
 AWS_REGIONS=us-east-1,us-west-2,ap-northeast-1,ap-northeast-2,ap-southeast-1,eu-west-1
 DATA_DIR=$DATA_DIR
-MONITOR_INTERVAL_SECONDS=900
+MONITOR_INTERVAL_SECONDS=300
 ALERT_COOLDOWN_SECONDS=3600
 TASK_POLL_SECONDS=3
 TELEGRAM_BOT_TOKEN=
@@ -120,7 +123,7 @@ WantedBy=multi-user.target
 UNIT
 cat > /etc/systemd/system/awscc-task-worker.service <<UNIT
 [Unit]
-Description=AWS Control Center Create Task Worker
+Description=AWS Control Center Task Worker
 After=network-online.target awscc-web.service
 Wants=network-online.target
 [Service]

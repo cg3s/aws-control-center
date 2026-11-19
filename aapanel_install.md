@@ -1,3 +1,5 @@
+> 历史部署说明：当前单 UI/API 的构建和升级步骤请优先使用 [README](README.md) 与 [QUICKSTART](QUICKSTART.md)。
+
 这个项目已经带有 Docker Compose 配置，在 aaPanel 上建议采用 **Docker 运行程序，aaPanel 的 Nginx 负责域名、HTTPS 和反向代理**。
 
 项目需要启动 **Web、监控 Worker、任务 Worker 共三个服务**，直接使用现有 Compose 文件即可。

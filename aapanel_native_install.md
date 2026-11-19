@@ -1,3 +1,5 @@
+> 历史部署说明：当前单 UI/API 的构建和升级步骤请优先使用 [README](README.md) 与 [QUICKSTART](QUICKSTART.md)。
+
 项目自带了 **Python 虚拟环境 + systemd 的原生安装脚本**。在 aaPanel 中，用该脚本运行程序，再由 aaPanel 配置域名和 HTTPS 反向代理即可。
 
 下面以 **Ubuntu 22.04 / 24.04、Debian 12** 为例，在 aaPanel 终端使用 root 执行。

@@ -9,7 +9,7 @@
 - **批量任务**：创建、删除、启动、停止、重启，单批最多 100 项；预览固定目标后确认提交，逐项状态及审计。
 - **EC2 创建**：按需 Linux、AMI、架构检查、现有子网/安全组、根盘、公网 IP、密钥对、实例角色，以及固定版本的 Launch Template。
 - **Lightsail 创建**：区域套餐、Linux 镜像、可用区、密钥对、价格预览。
-- **DIY 初始化**：默认用户/普通用户/root 公钥，root 密码哈希，独立 SSH 登录策略，首次启动 Bash 脚本，版本化模板及单次覆盖。
+- **DIY 初始化**：SSH 公钥、root 登录策略和密码哈希、AWS 入站防火墙、首次启动 Bash 脚本，支持保存模板与单次覆盖。
 - **SSH 脚本**：加密连接凭据、强制 SHA256 主机指纹、按实例绑定的独立连接、环境变量参数、可选免密 sudo、超时、退出码与加密保存的截断输出。
 - **流量**：入站/出站、平均 Mbps、1 小时/1 日/7 日/30 日及自然日/月查询；固定桶去重、迟到数据修正、完整性标识和监控实例排名。
 - **自动化**：通知、SSH 脚本、停机；连续超限、恢复阈值、冷却、每日上限、维护期、标签动态匹配、集合汇总阈值、历史模拟、规则暂停和全局紧急暂停。
@@ -66,6 +66,10 @@ sudo awscc upgrade /path/to/aws-control-center
 6. 在监控规则选择实例、窗口和阈值。默认只通知；明确选择自动执行模式后，按动作顺序执行脚本和停机。
 
 同一账户下，同名规则保存新版本时会停用旧版本；任务已保存配置快照。跨账户的历史规则仍可通过 CLI 管理。全局暂停阻止未开始的自动化动作，不会终止已经运行的远程命令。
+
+使用 root 密码登录时，在初始化模板选择「允许密码」并启用 SSH 密码认证，每次创建时填写 root 初始密码。创建预览会显示实际 SSH 策略。模板的公钥在允许 root 登录时会添加到 root，设置额外用户时也会添加给该用户。
+
+初始化模板的 AWS 入站规则支持 TCP/UDP、端口范围和 IPv4/IPv6 来源。规则为空时沿用服务原有设置。配置规则时，EC2 在启动前为该 VPC 创建或复用专用安全组，既有安全组的规则不受影响。Lightsail 先创建实例，再用模板替换默认公网入站规则并核对结果。需要登录 SSH 时，请在模板中包含 TCP 22 和允许连接的来源。
 
 ## 监控与可靠性
 
@@ -142,6 +146,7 @@ sudo awscc cost report --profile all
 - EC2：实例、镜像、规格、子网、VPC、安全组、密钥对、启动模板及实例属性的 Describe 权限；按需授予 `RunInstances`、`CreateTags`、`StartInstances`、`StopInstances`、`RebootInstances`、`TerminateInstances`。
 - 实例角色需要针对指定角色的 `iam:PassRole`；主机 SSH 脚本不使用面板的 AWS 密钥。
 - Lightsail：实例、区域、套餐、镜像、密钥对和指标查询；按需授权创建、删除、启停、重启及静态 IP 操作。
+- 模板防火墙：EC2 需要 `ec2:CreateSecurityGroup` 和 `ec2:AuthorizeSecurityGroupIngress`，Lightsail 需要 `lightsail:GetInstancePortStates`、`lightsail:PutInstancePublicPorts` 和 `lightsail:GetOperation`。
 - 流量：EC2 需要 `cloudwatch:GetMetricStatistics`；Lightsail 需要 `lightsail:GetInstanceMetricData`。
 - 成本：`ce:GetCostAndUsage` 与账户账单访问能力。
 

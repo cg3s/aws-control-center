@@ -8,7 +8,7 @@ from uuid import uuid4
 from datetime import datetime, timezone
 from fastapi import HTTPException
 from botocore.exceptions import ClientError
-from . import resources, ssh
+from . import firewall, resources, ssh
 from .bootstrap import render
 from .models import Launch
 from .store import stamp, document, documents, heartbeat
@@ -94,7 +94,13 @@ class Jobs:
             launch = dict(template['payload'])
             launch.update({k: options['launch'][k] for k in item.options.launch.model_fields_set})
             payload['bootstrap_version'] = template['version']
-        bootstrap = render(Launch(**launch), target['service'])
+        initialization = Launch(**launch)
+        bootstrap = render(initialization, target['service'])
+        rules = [rule.model_dump() for rule in initialization.firewall_rules]
+        if rules:
+            payload['firewall_rules'] = rules
+        payload['ssh_policy'] = {'root_login': initialization.root_login, 'password_auth': initialization.password_auth,
+                                 'root_password_set': bool(initialization.root_password)}
         api = w.client(target['profile'], target['service'], target['region'])
         if target['service'] == 'lightsail':
             catalog = resources.catalog(w, target['profile'], target['region'], 'lightsail')
@@ -146,9 +152,12 @@ class Jobs:
             if image[0]['Architecture'] not in types[0]['ProcessorInfo']['SupportedArchitectures']:
                 raise HTTPException(400, 'AMI architecture does not match instance type')
             subnet = api.describe_subnets(SubnetIds=[args.get('SubnetId', '')])['Subnets'][0]
-            groups = api.describe_security_groups(GroupIds=args.get('SecurityGroupIds', []))['SecurityGroups']
-            if not args.get('SecurityGroupIds') or any(g['VpcId'] != subnet['VpcId'] for g in groups):
-                raise HTTPException(400, 'Choose security groups from the subnet VPC')
+            if rules:
+                payload['firewall_vpc_id'] = subnet['VpcId']
+            else:
+                groups = api.describe_security_groups(GroupIds=args.get('SecurityGroupIds', []))['SecurityGroups']
+                if not args.get('SecurityGroupIds') or any(g['VpcId'] != subnet['VpcId'] for g in groups):
+                    raise HTTPException(400, 'Choose security groups from the subnet VPC')
             if not options['launch_template_id']:
                 root = image[0].get('RootDeviceName')
                 if not root or image[0].get('RootDeviceType') != 'ebs':
@@ -172,9 +181,11 @@ class Jobs:
                         TagSpecifications=[{'ResourceType': 'instance', 'Tags': [{'Key': k, 'Value': v} for k, v in tags.items()]}],
                         MetadataOptions={'HttpTokens': 'required'})
             if options['launch_template_id']:
-                # Keep the selected template's options; only AWSCC initialization and task tags override it.
+                # Keep the template's network interface, overriding only its groups when requested.
                 args = {k: args[k] for k in ('MinCount','MaxCount','UserData','MetadataOptions','TagSpecifications')} | {
                     'LaunchTemplate': {'LaunchTemplateId': options['launch_template_id'], 'Version': options['launch_template_version']}}
+                if rules:
+                    args['NetworkInterfaces'] = interfaces
                 args['TagSpecifications'] += [spec for spec in data.get('TagSpecifications',[]) if spec['ResourceType']!='instance']
                 if options['key_pair_name']:
                     args['KeyName'] = options['key_pair_name']
@@ -199,7 +210,8 @@ class Jobs:
             c.execute('INSERT INTO v2_documents VALUES(?,?,?,?,?,?,?)', (identifier, 'preview', 'Task preview', 1,
                       self.web.vault().encrypt(encode(payload).encode()), stamp(), stamp()))
         return {'preview_id': identifier, 'items': [{'kind': x['kind'], 'target': x['target'],
-                    'before': x.get('before'), 'estimate_usd_month': x.get('estimate_usd_month')} for x in prepared],
+                    'before': x.get('before'), 'estimate_usd_month': x.get('estimate_usd_month'),
+                    'ssh_policy': x.get('ssh_policy'), 'firewall_rules': x.get('firewall_rules', [])} for x in prepared],
                 'confirmation': 'DELETE' if any(x.kind == 'delete' for x in request.items) else 'EXECUTE',
                 'note': 'EC2 price is not estimated. Retained disks and IPs may continue to incur charges.'}
 
@@ -333,6 +345,11 @@ class Jobs:
                 api = w.mutation_client(target['profile'], target['service'], target['region'])
                 if kind == 'create':
                     if target['service'] == 'ec2':
+                        if payload.get('firewall_rules'):
+                            read_api = w.client(target['profile'], 'ec2', target['region'])
+                            group_id = firewall.ec2_group(read_api, api, payload['firewall_vpc_id'], payload['firewall_rules'])
+                            payload['aws_args']['NetworkInterfaces'][0]['Groups'] = [group_id]
+                            result.update(firewall_group_id=group_id, firewall_status='applied')
                         for tag in payload['aws_args']['TagSpecifications'][0]['Tags']:
                             if tag['Key'] == 'awscc-created-at':
                                 tag['Value'] = stamp()
@@ -393,10 +410,19 @@ class Jobs:
             target['instance'] = result['instance_id']
         current = resources.observe(self.web, target)
         if row['kind'] == 'create' and target['service'] == 'lightsail':
-            x = self.web.client(target['profile'], 'lightsail', target['region']).get_instance(instanceName=target['instance'])['instance']
+            read_api = self.web.client(target['profile'], 'lightsail', target['region'])
+            x = read_api.get_instance(instanceName=target['instance'])['instance']
             if not any(t.get('key') == 'awscc-task' and t.get('value') == row['id'] for t in x.get('tags', [])):
                 waiting = time.time()-datetime.fromisoformat(row['attempted_at']).timestamp() < 1800
                 return ('verifying' if waiting else 'unknown'), result | {'state': current['state'], 'note': 'Task ownership not verified'}
+            if payload.get('firewall_rules'):
+                write_api = self.web.mutation_client(target['profile'], 'lightsail', target['region'])
+                result['state'] = current['state']
+                firewall_state = firewall.lightsail_state(read_api, write_api, target['instance'], payload['firewall_rules'], result)
+                if firewall_state != 'succeeded':
+                    if firewall_state == 'verifying' and time.time()-datetime.fromisoformat(row['attempted_at']).timestamp() > 1800:
+                        return 'unknown', result
+                    return firewall_state, result
         elif row['kind'] != 'create' and current['generation'] != target['generation']:
             return 'unknown', result | {'note': 'Instance generation changed'}
         expected = {'create': 'running', 'start': 'running', 'stop': 'stopped', 'delete': 'terminated', 'reboot': 'running'}[row['kind']]

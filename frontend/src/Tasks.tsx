@@ -2,6 +2,7 @@ import {useState} from 'react';
 import {Alert, Button, Card, Checkbox, Descriptions, Form, Input, InputNumber, Select, Space, Table, Tag} from 'antd';
 import {api, post, qs, Filters, Target, Task, Configuration} from './api';
 import {attempt, ErrorBox, useRemote, useTaskSubmission} from './shared';
+import {FirewallFields} from './FirewallFields';
 
 type Catalog = {bundles?: {id: string; name: string; price_usd_per_month: number}[]; blueprints?: {id: string; name: string}[]; zones?: string[];
   subnets?: {SubnetId: string; VpcId: string; AvailabilityZone: string}[]; security_groups?: {GroupId: string; GroupName: string; VpcId: string}[];
@@ -13,7 +14,17 @@ export function Create({filters, refresh, epoch}: {filters: Filters; refresh: ()
   const templates = useRemote<{items: Configuration[]}>('/configurations?kind=bootstrap', epoch);
   const jobs = useTaskSubmission(() => {form.resetFields([['launch', 'root_password']]); refresh();});
   const specific = filters.region !== 'all';
+  const rootLogin = Form.useWatch(['launch', 'root_login'], form);
+  const firewallRules = Form.useWatch(['launch', 'firewall_rules'], form);
+  const hasFirewall = !!firewallRules?.length;
   const subnet = Form.useWatch('subnet_id', form), vpc = catalog?.subnets?.find(x => x.SubnetId === subnet)?.VpcId;
+  const applyTemplate = (id?: string) => {
+    const template = templates.data?.items.find(x => x.id === id);
+    const rootPassword = form.getFieldValue(['launch', 'root_password']);
+    form.setFieldValue('launch', {
+      root_login: 'disabled', password_auth: false, firewall_rules: [], ...template?.payload, root_password: rootPassword,
+    });
+  };
   const load = async () => {
     setError(''); setLoading(true); setCatalog(undefined);
     try {setCatalog(await api<Catalog>('/catalog?' + qs({profile: filters.profile, region: filters.region, service})));}
@@ -35,17 +46,25 @@ export function Create({filters, refresh, epoch}: {filters: Filters; refresh: ()
           <Form.Item name="image_id" label="Linux AMI ID（可输入公开 AMI）" rules={[{required: true}]}><Input placeholder="ami-..." list="owned-amis"/></Form.Item><datalist id="owned-amis">{catalog?.images?.map(x => <option key={x.ImageId} value={x.ImageId}>{x.Name}</option>)}</datalist>
           <Form.Item name="instance_type" label="实例规格" rules={[{required: true}]}><Select showSearch options={catalog?.instance_types?.map(x => ({value: x.InstanceType, label: x.InstanceType}))}/></Form.Item>
           <Form.Item name="subnet_id" label="现有子网 / VPC" rules={[{required: true}]}><Select onChange={() => form.resetFields(['security_group_ids'])} options={catalog?.subnets?.map(x => ({value: x.SubnetId, label: `${x.SubnetId} · ${x.VpcId} · ${x.AvailabilityZone}`}))}/></Form.Item>
-          <Form.Item name="security_group_ids" label="安全组" rules={[{required: true}]}><Select mode="multiple" options={catalog?.security_groups?.filter(x => x.VpcId === vpc).map(x => ({value: x.GroupId, label: `${x.GroupName} · ${x.GroupId}`}))}/></Form.Item>
+          {hasFirewall ? <Alert type="info" message="此实例将使用按入站规则创建的专用 EC2 安全组。"/>
+            : <Form.Item name="security_group_ids" label="安全组" rules={[{required: true}]}><Select mode="multiple" options={catalog?.security_groups?.filter(x => x.VpcId === vpc).map(x => ({value: x.GroupId, label: `${x.GroupName} · ${x.GroupId}`}))}/></Form.Item>}
           <Form.Item name="disk_gib" label="根磁盘 GiB"><InputNumber min={8} max={16384}/></Form.Item><Form.Item name="instance_profile_arn" label="实例 IAM Profile ARN（可选）"><Input/></Form.Item>
         </>}
         {mode==='form'?<Form.Item name="public_ip" valuePropName="checked"><Checkbox>分配公网 IPv4</Checkbox></Form.Item>:<Alert type="info" message="网络与磁盘沿用固定模板版本；下方初始化配置替换模板 UserData。"/>}
       </>}
       <Form.Item name="tags_json" label="实例标签 JSON（可选，也可用于自动化规则匹配）"><Input.TextArea placeholder={'{"environment":"dev"}'}/></Form.Item><Form.Item name="key_pair_name" label="AWS 区域密钥对名称（可选）"><Input/></Form.Item>
-      <Form.Item name="bootstrap_id" label="初始化模板（选择后可继续修改下方设置）"><Select allowClear onChange={id=>{const template=templates.data?.items.find(x=>x.id===id);if(template)form.setFieldsValue({launch:{...template.payload,root_password:form.getFieldValue(['launch','root_password'])}});}} options={templates.data?.items.map(x => ({value: x.id, label: `${x.name} v${x.version}`}))}/></Form.Item>
+      <Form.Item name="bootstrap_id" label="初始化模板（选择后可继续修改下方设置）"><Select allowClear onChange={applyTemplate} options={templates.data?.items.map(x => ({value: x.id, label: `${x.name} v${x.version}`}))}/></Form.Item>
       <Form.Item name={['launch', 'username']} label="额外普通用户（可选）"><Input/></Form.Item><Form.Item name={['launch', 'ssh_public_key']} label="SSH 公钥，每行一条"><Input.TextArea rows={3}/></Form.Item>
-      <Form.Item name={['launch', 'root_password']} label="root 初始密码（至少 16 位，可选）" rules={[{min: 16}]}><Input.Password autoComplete="new-password"/></Form.Item>
-      <Form.Item name={['launch', 'root_login']} label="root SSH 登录"><Select options={[{value: 'disabled', label: '禁止'}, {value: 'key', label: '仅密钥'}, {value: 'password', label: '允许密码'}]}/></Form.Item>
+      <Form.Item name={['launch', 'root_login']} label="root SSH 登录" extra="通过 SSH 使用 root 密码登录，请选择「允许密码」。">
+        <Select onChange={value => {if (value === 'password') form.setFieldValue(['launch', 'password_auth'], true);}}
+          options={[{value: 'disabled', label: '禁止'}, {value: 'key', label: '仅密钥'}, {value: 'password', label: '允许密码'}]}/>
+      </Form.Item>
+      <Form.Item name={['launch', 'root_password']} label="root 初始密码（至少 16 位）"
+        rules={[{required: rootLogin === 'password', message: '请填写 root 初始密码'}, {min: 16, message: '至少输入 16 位'}]}>
+        <Input.Password autoComplete="new-password"/>
+      </Form.Item>
       <Form.Item name={['launch', 'password_auth']} valuePropName="checked"><Checkbox>启用 SSH 密码认证</Checkbox></Form.Item><Form.Item name={['launch', 'user_data']} label="首次启动 Bash 脚本"><Input.TextArea rows={7} placeholder={'#!/bin/bash\nset -e\n'}/></Form.Item>
+      <FirewallFields name={['launch', 'firewall_rules']}/>
       <Button type="primary" htmlType="submit" disabled={!specific || !catalog} loading={jobs.busy}>预览目标与配置</Button>
     </Form>{jobs.modal}</Card>;
 }

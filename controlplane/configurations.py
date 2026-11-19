@@ -7,7 +7,7 @@ from pydantic import ValidationError
 from fastapi import HTTPException
 from . import resources
 from .models import Launch, Script, Connection, Rule
-from .bootstrap import render
+from .bootstrap import validate_launch
 from .store import document, documents, stamp
 
 
@@ -44,10 +44,10 @@ class Configurations:
             model = {'bootstrap': Launch, 'connection': Connection, 'script': Script, 'rule': Rule}[data.kind](**data.payload)
             payload = model.model_dump()
             if data.kind == 'bootstrap':
-                render(model, 'lightsail')
                 # Password input is supplied only per creation.
                 if payload.get('root_password'):
                     raise HTTPException(400, 'Saved templates cannot contain root passwords; set them per creation')
+                validate_launch(model, template=True)
             if data.kind == 'connection' and not (payload['private_key'] or payload['password']):
                 raise HTTPException(400, 'Supply a private key or password')
             if data.kind == 'rule':

@@ -1,5 +1,6 @@
+from ipaddress import ip_network
 from typing import Literal, Annotated
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
 
 class Strict(BaseModel):
@@ -19,6 +20,24 @@ class Target(Strict):
     created_at: str = ''
 
 
+class FirewallRule(Strict):
+    protocol: Literal['tcp', 'udp']
+    from_port: int = Field(ge=1, le=65535)
+    to_port: int = Field(ge=1, le=65535)
+    cidr: str = Field(min_length=1, max_length=64)
+
+    @field_validator('cidr')
+    @classmethod
+    def normalize_cidr(cls, value):
+        return str(ip_network(value.strip(), strict=False))
+
+    @model_validator(mode='after')
+    def validate_port_range(self):
+        if self.from_port > self.to_port:
+            raise ValueError('End port must be at least the start port')
+        return self
+
+
 class Launch(Strict):
     user_data: str = Field(default='', max_length=40000)
     ssh_public_key: str = Field(default='', max_length=12000)
@@ -26,6 +45,7 @@ class Launch(Strict):
     root_login: Literal['disabled', 'key', 'password'] = 'disabled'
     password_auth: bool = False
     username: str = Field(default='', pattern=r'^[a-z_][a-z0-9_-]{0,31}$|^$')
+    firewall_rules: list[FirewallRule] = Field(default_factory=list, max_length=50)
 
 
 class CreateOptions(Strict):

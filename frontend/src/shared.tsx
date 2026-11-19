@@ -22,7 +22,16 @@ export function useRemote<T>(path: string | null, epoch = 0) {
 }
 export function ErrorBox({error}: {error?: string}) { return error ? <Alert type="error" showIcon message={error} className="section"/> : null; }
 
-type Preview = {preview_id: string; confirmation: string; items: Array<{kind: string; target: {profile: string; region: string; instance: string}; before?: unknown; estimate_usd_month?: number}>; note: string};
+type PreviewItem = {
+  kind: string;
+  target: {profile: string; region: string; instance: string};
+  before?: unknown;
+  estimate_usd_month?: number;
+  ssh_policy?: {root_login: 'disabled' | 'key' | 'password'; password_auth: boolean; root_password_set: boolean};
+  firewall_rules?: {protocol: string; from_port: number; to_port: number; cidr: string}[];
+};
+type Preview = {preview_id: string; confirmation: string; items: PreviewItem[]; note: string};
+const rootLoginLabels = {disabled: '禁止', key: '仅密钥', password: '允许密码'};
 export function useTaskSubmission(done: () => void) {
   const [pending, setPending] = useState<{request: {request_key: string; items: JobItem[]}; preview: Preview}>(), [busy, setBusy] = useState(false), [confirm, setConfirm] = useState('');
   const submit = async (items: JobItem[]) => {
@@ -48,7 +57,19 @@ export function useTaskSubmission(done: () => void) {
     <Table size="small" pagination={{pageSize: 5}} rowKey={(_, i) => String(i)} dataSource={pending?.preview.items} columns={[
       {title: '操作', dataIndex: 'kind'}, {title: '账户', render: (_, x) => x.target.profile}, {title: '区域', render: (_, x) => x.target.region},
       {title: '实例', render: (_, x) => x.target.instance}, {title: '月费估算 USD', render: (_, x) => x.estimate_usd_month ?? '未估算'},
-    ]} expandable={{expandedRowRender: x => <pre className="detail">{JSON.stringify(x.before, null, 2)}</pre>}}/>
+      ...(pending?.preview.items.some(item => item.ssh_policy) ? [{title: 'root SSH', render: (_: unknown, {ssh_policy}: PreviewItem) => ssh_policy
+        ? `${rootLoginLabels[ssh_policy.root_login]} · SSH 密码认证${ssh_policy.password_auth ? '启用' : '关闭'}` : '—'}] : []),
+    ]} expandable={{
+      rowExpandable: x => !!(x.before || x.firewall_rules?.length),
+      expandedRowRender: x => <>
+        {x.before != null && <pre className="detail">{JSON.stringify(x.before, null, 2)}</pre>}
+        {x.firewall_rules?.map((rule, index) => <div key={index}>
+          {rule.protocol.toUpperCase()} {rule.from_port}{rule.to_port !== rule.from_port ? `–${rule.to_port}` : ''} · {rule.cidr}
+        </div>)}
+      </>,
+    }}/>
+    {pending?.preview.items.some(x => x.firewall_rules?.length) &&
+      <Alert type="info" message="已配置 AWS 入站防火墙。展开实例行可核对将应用的端口和来源。"/>}
     <Typography.Paragraph>{pending?.preview.note}</Typography.Paragraph>
     <Space direction="vertical"><Typography.Text>输入 {pending?.preview.confirmation} 确认以上固定目标清单</Typography.Text><Input value={confirm} onChange={e => setConfirm(e.target.value)}/></Space>
   </Modal>;

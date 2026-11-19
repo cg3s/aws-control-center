@@ -1,11 +1,18 @@
 import base64
 import json
+import os
+import shlex
+import shutil
+import subprocess
+from pathlib import Path
+
 import pytest
 from fastapi import HTTPException
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
 from controlplane.models import Launch
 from controlplane.bootstrap import render
+from passlib.hash import sha512_crypt
 
 
 def public_key():
@@ -16,9 +23,10 @@ def test_password_is_hashed_and_ssh_options_are_independent():
     source = render(Launch(root_password='a-strong-password-1234'), 'ec2')
     assert 'a-strong-password-1234' not in source
     config = json.loads(source.split('\n', 1)[1])
-    assert config['users'][1]['hashed_passwd'].startswith('$6$')
-    assert config['ssh_pwauth'] is False
-    assert 'PermitRootLogin no' in source
+    script = config['write_files'][0]
+    assert script['permissions'] == '0700' and config['runcmd'] == [['/bin/bash', script['path']]]
+    assert config['disable_root'] is True and config['users'] == ['default']
+    assert 'PermitRootLogin no' in script['content'] and 'PasswordAuthentication no' in script['content']
 
 
 @pytest.mark.parametrize('launch', [dict(root_password='short'), dict(ssh_public_key='private-key'), dict(root_login='key'),
@@ -30,11 +38,13 @@ def test_invalid_initialization_rejected(launch):
 
 def test_default_and_regular_user_public_keys():
     key = public_key()
-    data = json.loads(render(Launch(ssh_public_key=key), 'lightsail').split('\n',1)[1])
+    data = json.loads(render(Launch(ssh_public_key=key), 'ec2').split('\n',1)[1])
     assert data['ssh_authorized_keys'] == [key]
     data = json.loads(render(Launch(ssh_public_key=key,username='operator'), 'ec2').split('\n',1)[1])
     assert data['users'][1]['name'] == 'operator'
     assert data['users'][1]['ssh_authorized_keys'] == [key]
+    assert f'login_keys={shlex.quote(key)}' in render(Launch(ssh_public_key=key), 'lightsail')
+    assert 'extra_user=operator' in render(Launch(ssh_public_key=key, username='operator'), 'lightsail')
 
 
 def test_ec2_userdata_size_is_checked_after_encoding():
@@ -44,7 +54,6 @@ def test_ec2_userdata_size_is_checked_after_encoding():
 
 def test_password_template_applies_auth_policy_on_launch(control, monkeypatch):
     from botocore.exceptions import ClientError
-    from passlib.hash import sha512_crypt
     from controlplane import resources
     from test_tasks import enqueue, request
 
@@ -72,12 +81,81 @@ def test_password_template_applies_auth_policy_on_launch(control, monkeypatch):
     assert web.control_jobs.run_once()
     user_data = aws.create_instances.call_args.kwargs['userData']
     assert password not in user_data
-    config = json.loads(user_data.split('\n', 1)[1])
-    assert config['disable_root'] is False and config['ssh_pwauth'] is True
-    root = next(user for user in config['users'] if isinstance(user, dict) and user['name'] == 'root')
-    assert root['ssh_authorized_keys'] == [key] and root['lock_passwd'] is False
-    assert sha512_crypt.verify(password, root['hashed_passwd'])
-    assert 'PermitRootLogin yes' in config['runcmd'][0][2]
+    assert user_data.startswith('#!/bin/bash\n')
+    assert f'root_keys={shlex.quote(key)}' in user_data
+    password_assignment = next(line for line in user_data.splitlines() if line.startswith('root_password_hash='))
+    assert sha512_crypt.verify(password, shlex.split(password_assignment)[0].split('=', 1)[1])
+    assert 'PermitRootLogin yes' in user_data and 'AuthenticationMethods any' in user_data
+
+
+@pytest.mark.parametrize('service', ['ec2', 'lightsail'])
+@pytest.mark.parametrize('password_applied', [True, False])
+def test_bootstrap_applies_root_password_and_key_before_ssh_reload(tmp_path, service, password_applied):
+    bash = shutil.which('bash')
+    if os.name == 'nt':
+        git = shutil.which('git')
+        git_bash = Path(git).parent.parent / 'bin' / 'bash.exe' if git else None
+        bash = str(git_bash) if git_bash and git_bash.is_file() else None
+    if not bash:
+        pytest.skip('Linux Bash or Git Bash is required to execute the launch script')
+
+    root = tmp_path / 'root'
+    (root / '.ssh').mkdir(parents=True)
+    key = public_key()
+    vendor_key = f'command="echo vendor redirect" {key}'
+    keys = root / '.ssh' / 'authorized_keys'
+    keys.write_text(vendor_key + '\n', encoding='utf-8')
+    sshd_config = tmp_path / 'sshd_config'
+    sshd_config.write_text('PermitRootLogin no\nAuthenticationMethods publickey\n', encoding='utf-8')
+    password = '  Test! $root:pass  '
+    launch = Launch(root_password=password, root_login='password', password_auth=True, ssh_public_key=key)
+    source = render(launch, service)
+    script = json.loads(source.split('\n', 1)[1])['write_files'][0]['content'] if service == 'ec2' else source
+    script = script.replace('/etc/ssh/sshd_config', './sshd_config').replace('/run/sshd', './run/sshd')
+    system_commands = r'''
+chpasswd() {
+    test "$1" = -e
+    cut -d: -f2 > root-hash
+}
+getent() {
+    if [ "$1" = passwd ]; then
+        printf 'root:x:0:0:root:%s/root:/bin/bash\n' "$PWD"
+    else
+        printf 'root:%s:20500:0:99999:7:::\n' "$(cat root-hash)"
+    fi
+}
+runuser() { shift 3; "$@"; }
+sshd() {
+    grep -qx 'PermitRootLogin yes' "$3"
+    grep -qx '    AuthenticationMethods any' "$3"
+    if [ "$1" = -T ]; then
+        printf '%s\n' 'permitrootlogin yes' 'passwordauthentication yes' 'pubkeyauthentication yes' 'authenticationmethods any'
+    fi
+}
+systemctl() {
+    if [ "$1" = reload ]; then
+        test -s root-hash
+        echo reloaded > ssh-result
+    fi
+}
+'''
+    if not password_applied:
+        system_commands += "chpasswd() { cat >/dev/null; printf '!\\n' > root-hash; }\n"
+    result = subprocess.run([bash, '--noprofile', '--norc', '-s'], input=system_commands + script,
+                            cwd=tmp_path, encoding='utf-8', capture_output=True, timeout=15)
+    output = result.stdout + result.stderr
+    installed_hash = (tmp_path / 'root-hash').read_text(encoding='utf-8').strip()
+    assert password not in output
+    if password_applied:
+        assert result.returncode == 0, result.stderr
+        assert installed_hash not in output and sha512_crypt.verify(password, installed_hash)
+        assert keys.read_text(encoding='utf-8').splitlines() == [key, vendor_key]
+        assert (tmp_path / 'ssh-result').exists()
+        assert 'AWSCC: Initialization complete' in result.stdout
+    else:
+        assert result.returncode != 0
+        assert 'Root password hash was not applied' in result.stderr
+        assert not (tmp_path / 'ssh-result').exists()
 
 
 def test_bootstrap_template_edit_updates_original_and_rejects_stale_writes(control):

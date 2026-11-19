@@ -69,6 +69,10 @@ sudo awscc upgrade /path/to/aws-control-center
 
 使用 root 密码登录时，在初始化模板选择「允许密码」并启用 SSH 密码认证，每次创建时填写 root 初始密码。创建预览会显示实际 SSH 策略。模板的公钥在允许 root 登录时会添加到 root，设置额外用户时也会添加给该用户。
 
+新实例的启动日志会记录系统 root 密码、SSH 公钥和 SSH 配置的应用结果。现有实例可先用 AWS 控制台默认用户登录，运行 `sudo passwd root` 交互式重设密码。然后用 `sudo passwd -S root` 检查系统账户，用 `sudo sshd -T -C user=root,host=localhost,addr=127.0.0.1` 检查 root 的 SSH 策略，两者是独立的设置。
+
+如需在现有实例恢复 root SSH，在 `/etc/ssh/sshd_config` 的全局区检查 `PermitRootLogin yes`、`PasswordAuthentication yes` 和 `PubkeyAuthentication yes`。如镜像对 root 有 `Match` 规则，确认该规则也允许所选认证方式。公钥放在 `/root/.ssh/authorized_keys`，目录权限为 `700`，文件权限为 `600`。保留当前 AWS 控制台会话，运行 `sudo sshd -t` 校验配置后再重载 `ssh` 或 `sshd` 服务，并在新会话中测试。
+
 初始化模板的 AWS 入站规则支持 TCP/UDP、端口范围和 IPv4/IPv6 来源。规则为空时沿用服务原有设置。配置规则时，EC2 在启动前为该 VPC 创建或复用专用安全组，既有安全组的规则不受影响。Lightsail 先创建实例，再用模板替换默认公网入站规则并核对结果。需要登录 SSH 时，请在模板中包含 TCP 22 和允许连接的来源。
 
 在「实例管理」勾选正在运行、使用动态公网 IPv4 的实例，点击「批量更换公网 IP」。EC2 通过主网卡重新分配动态地址，需要只有一块网卡。Lightsail 按账户和区域逐台绑定、解绑并释放任务专用的临时静态 IP，需要空闲的静态 IP 配额。更换期间公网连接会中断。任务中心显示原地址和核验后的新地址。
